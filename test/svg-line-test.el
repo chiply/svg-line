@@ -312,6 +312,7 @@ with the modified accent so the unsaved state stays visible."
 ;;;; define + activate
 
 (ert-deftest svg-line/define-creates-renderer ()
+  (skip-unless (image-type-available-p 'svg))
   (svg-line-define 'test-line
     :target 'tab-bar :layout 'lines
     :content (lambda () '((("hello") . nil))))
