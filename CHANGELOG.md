@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/chiply/svg-line/compare/v0.1.0...v0.1.1) (2026-06-08)
+
+
+### Features
+
+* auto-derive char-advance from font size; add svg-line-segs-from-string ([#2](https://github.com/chiply/svg-line/issues/2)) ([218dcfc](https://github.com/chiply/svg-line/commit/218dcfcaee2602bd2f19ec5eb9e51988bc6a8195))
+
 ## 0.1.0 (2026-06-08)
 
 
