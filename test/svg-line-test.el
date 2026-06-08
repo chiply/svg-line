@@ -232,6 +232,64 @@ with the modified accent so the unsaved state stays visible."
     ;; the "·" separator between c1 and c2 is plain text
     (should (equal (nth 1 (nth 3 runs)) "·"))))
 
+;;;; char-advance derivation
+
+(ert-deftest svg-line/char-advance-default-auto ()
+  "The default advance is nil (auto-derived), not a fixed pixel constant."
+  (should (null svg-line-char-advance)))
+
+(ert-deftest svg-line/char-advance-explicit-and-derived ()
+  "An explicit advance wins; nil derives from font size and scales with it."
+  (let ((svg-line-char-advance-ratio 0.6))
+    (should (= 8 (svg-line--char-advance 8 15)))     ; explicit wins
+    (should (= 9 (svg-line--char-advance nil 15)))   ; round(15*0.6)
+    (should (= 12 (svg-line--char-advance nil 20)))  ; scales with size
+    (should (= 1 (svg-line--char-advance nil 1)))))  ; never below 1
+
+(ert-deftest svg-line/char-advance-derived-drives-layout ()
+  "With no explicit advance, a :seg's recorded width tracks the derived advance."
+  (let* ((svg-line-char-advance nil)
+         (svg-line-char-advance-ratio 0.6)
+         (svg-line--lines-placements nil)
+         (seg (list (svg-line-seg "AAA" :id 'a)))   ; 3 chars
+         (_ (svg-line-image (list (cons (svg-line--side seg) nil))
+                            :width 400 :font "Monospace" :font-size 20))
+         (p (car svg-line--lines-placements)))
+    (should p)
+    ;; placement is (X TOP W ITEM); W = 3 chars * derived advance (12) = 36
+    (should (= (nth 2 p) (* 3 (svg-line--char-advance nil 20))))))
+
+;;;; svg-line-segs-from-string
+
+(ert-deftest svg-line/segs-from-string ()
+  "Regions with a mouse-1 keymap become interactive segs; others stay text."
+  (let* ((km (let ((m (make-sparse-keymap)))
+               (define-key m [mode-line mouse-1] #'ignore) m))
+         (str (concat "plain "
+                      (propertize "click" 'keymap km 'help-echo "do it\nmore")))
+         (group (svg-line-segs-from-string str 'test)))
+    (should (eq (car group) :svg-segs))
+    (let ((items (cdr group)))
+      (should (member "plain " items))            ; no keymap -> literal text
+      (let ((seg (cl-find-if (lambda (x) (and (consp x) (eq (car x) :svg-seg)))
+                             items)))
+        (should seg)
+        (should (equal (nth 1 seg) "click"))
+        (should (eq (plist-get (cddr seg) :action) #'ignore))
+        (should (equal (plist-get (cddr seg) :help) "do it"))  ; first line only
+        (should (equal (plist-get (cddr seg) :id) '(test . 1)))))))
+
+(ert-deftest svg-line/segs-from-string-no-binding-stays-text ()
+  "A keymap without a mouse-1 command leaves the region as plain text."
+  (let* ((km (make-sparse-keymap))   ; no mouse-1 binding
+         (str (propertize "label" 'keymap km))
+         (group (svg-line-segs-from-string str)))
+    (should (equal (cdr group) '("label")))))
+
+(ert-deftest svg-line/segs-from-string-empty ()
+  (should-not (svg-line-segs-from-string ""))
+  (should-not (svg-line-segs-from-string nil)))
+
 (ert-deftest svg-line/seg-placements-recorded ()
   "Drawing interactive segments records their placements (X TOP W ITEM)."
   (let* ((svg-line--lines-placements nil)
