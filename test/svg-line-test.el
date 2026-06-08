@@ -290,6 +290,18 @@ with the modified accent so the unsaved state stays visible."
   (should-not (svg-line-segs-from-string ""))
   (should-not (svg-line-segs-from-string nil)))
 
+(ert-deftest svg-line/map-string-regions ()
+  "The primitive yields (TEXT START HANDLER HELP) per keymap region."
+  (let* ((km (let ((m (make-sparse-keymap)))
+               (define-key m [mouse-1] #'ignore) m))
+         (str (concat "ab" (propertize "CD" 'keymap km 'help-echo "hi")))
+         (calls (svg-line-map-string-regions
+                 str (lambda (text start handler help)
+                       (list text start (and handler t) help)))))
+    (should (equal calls
+                   '(("ab" 0 nil nil)
+                     ("CD" 2 t "hi"))))))
+
 (ert-deftest svg-line/seg-placements-recorded ()
   "Drawing interactive segments records their placements (X TOP W ITEM)."
   (let* ((svg-line--lines-placements nil)

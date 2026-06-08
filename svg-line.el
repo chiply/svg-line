@@ -660,58 +660,79 @@ breadcrumbs.  nil ITEMS are dropped."
   (cons :svg-segs (delq nil items)))
 
 ;;;###autoload
+(defun svg-line-map-string-regions (str fn)
+  "Map FN over the keymap regions of propertized STR, collecting non-nil results.
+STR is split into maximal regions delimited by changes in its `keymap' /
+`local-map' text property.  For each region FN is called with four arguments:
+  TEXT     the region's unpropertized substring;
+  START    its start index in STR;
+  HANDLER  the region's mouse-1 command (a function) -- looked up in its map as
+           `[mode-line mouse-1]', `[header-line mouse-1]' or `[mouse-1]' -- or
+           nil when the region carries no such binding;
+  HELP     the region's `help-echo' text property (usually a string), or nil.
+FN returns an item (typically a string, or an `svg-line-seg' form) or nil; the
+non-nil results are collected in order.  This is the splitting and
+handler-extraction primitive behind `svg-line-segs-from-string'; call it
+directly to render existing clickable mode-line content (a breadcrumb header
+line, `which-func', VC, ...) as svg-line segments with your own action/help/id
+\(e.g. a direct jump derived from the region's other text properties)."
+  (let ((out nil) (i 0) (n (length str)))
+    (while (< i n)
+      (let* ((km (or (get-text-property i 'keymap str)
+                     (get-text-property i 'local-map str)))
+             (next (min (or (next-single-property-change i 'keymap str) n)
+                        (or (next-single-property-change i 'local-map str) n)))
+             ;; `lookup-key' returns an integer (not nil) for a too-long key,
+             ;; so take the first binding that is actually `functionp'.
+             (handler (and (keymapp km)
+                           (seq-some (lambda (k)
+                                       (let ((b (lookup-key km k)))
+                                         (and (functionp b) b)))
+                                     (list [mode-line mouse-1]
+                                           [header-line mouse-1]
+                                           [mouse-1]))))
+             (item (funcall fn (substring-no-properties str i next) i handler
+                            (get-text-property i 'help-echo str))))
+        (when item (push item out))
+        (setq i next)))
+    (nreverse out)))
+
+;;;###autoload
 (defun svg-line-segs-from-string (str &optional id-prefix)
   "Convert a propertized mode-line/header-line STR into interactive segments.
 Existing mode-line content -- a breadcrumb header line, `which-func', a VC
 indicator, ... -- already carries `keymap'/`local-map' text properties whose
 mouse-1 binding performs the click action and a `help-echo' for the tooltip.
-This splits STR into maximal regions by those map properties: a region whose
-map binds a real command to mouse-1 (looked up as `[mode-line mouse-1]',
-`[header-line mouse-1]' or `[mouse-1]') becomes an interactive `svg-line-seg'
-whose `:action' invokes that command and whose `:help' is the region's
-`help-echo' (first line); the remaining regions stay plain text.  The result is
-an `svg-line-segs' group usable as a `lines' content segment, so existing
-clickable mode-line content can be rendered by svg-line with its click and
-hover affordances intact.
+Each region whose map binds a real command to mouse-1 becomes an interactive
+`svg-line-seg' whose `:action' invokes that command and whose `:help' is the
+region's `help-echo' (first line); the remaining regions stay plain text.  The
+result is an `svg-line-segs' group usable as a `lines' content segment, so
+existing clickable mode-line content can be rendered by svg-line with its click
+and hover affordances intact.
 
 The click invokes the bound command with the originating mouse event, so a
 handler that reads its window/position from that event (the usual mode-line
 convention) still works.  ID-PREFIX namespaces the per-segment hover `:id's
 \(each is (ID-PREFIX . N), defaulting to (svg-line-seg . N)) -- pass a value
 unique per bar/window when several share an indicator.  Returns nil for an
-empty STR."
+empty STR.  For finer control (a custom action/help/id) build on
+`svg-line-map-string-regions' directly."
   (when (and (stringp str) (> (length str) 0))
-    (let ((parts nil) (i 0) (n (length str)) (idx 0)
-          (prefix (or id-prefix 'svg-line-seg)))
-      (while (< i n)
-        (let* ((km (or (get-text-property i 'keymap str)
-                       (get-text-property i 'local-map str)))
-               (next (min (or (next-single-property-change i 'keymap str) n)
-                          (or (next-single-property-change i 'local-map str) n)))
-               (text (substring-no-properties str i next))
-               ;; `lookup-key' returns an integer (not nil) for a too-long key,
-               ;; so take the first binding that is actually `functionp'.
-               (handler (and (keymapp km)
-                             (seq-some (lambda (k)
-                                         (let ((b (lookup-key km k)))
-                                           (and (functionp b) b)))
-                                       (list [mode-line mouse-1]
-                                             [header-line mouse-1]
-                                             [mouse-1]))))
-               (he (get-text-property i 'help-echo str)))
-          (if (and handler (> (length (string-trim text)) 0))
-              (setq idx (1+ idx)
-                    parts (cons (svg-line-seg
-                                 text
-                                 :id (cons prefix idx)
-                                 :help (and (stringp he)
-                                            (substring-no-properties
-                                             (car (split-string he "\n"))))
-                                 :action handler)
-                                parts))
-            (push text parts))
-          (setq i next)))
-      (apply #'svg-line-segs (nreverse parts)))))
+    (let ((idx 0) (prefix (or id-prefix 'svg-line-seg)))
+      (apply #'svg-line-segs
+             (svg-line-map-string-regions
+              str
+              (lambda (text _start handler help)
+                (if (and handler (> (length (string-trim text)) 0))
+                    (progn
+                      (setq idx (1+ idx))
+                      (svg-line-seg text
+                                    :id (cons prefix idx)
+                                    :help (and (stringp help)
+                                               (substring-no-properties
+                                                (car (split-string help "\n"))))
+                                    :action handler))
+                  text)))))))
 
 (defun svg-line--wrap-place (items width char-advance gap lh &optional center)
   "Return placements (X TOP CW ITEM) for ITEMS in a `wrap' layout.
