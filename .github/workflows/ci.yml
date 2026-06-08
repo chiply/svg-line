@@ -28,14 +28,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix
-        if: runner.os != 'Windows'
-        uses: DeterminateSystems/determinate-nix-action@v3
-
-      - name: Cache Nix store
-        if: runner.os != 'Windows'
-        uses: DeterminateSystems/magic-nix-cache-action@main
-
       - name: Set up Emacs
         uses: jcs090218/setup-emacs@master
         with:
@@ -68,12 +60,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@v3
-
-      - name: Cache Nix store
-        uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Set up Emacs
         uses: jcs090218/setup-emacs@master
