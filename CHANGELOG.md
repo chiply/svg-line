@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/chiply/svg-line/compare/v0.1.1...v0.1.2) (2026-06-08)
+
+
+### Features
+
+* extract svg-line-map-string-regions primitive ([#4](https://github.com/chiply/svg-line/issues/4)) ([55cf773](https://github.com/chiply/svg-line/commit/55cf773ae6c231fe01ed0f0a19290e596b2adbac))
+
 ## [0.1.1](https://github.com/chiply/svg-line/compare/v0.1.0...v0.1.1) (2026-06-08)
 
 
