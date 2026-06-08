@@ -2,7 +2,7 @@
 
 (package "svg-line"
 ; x-release-please-start-version
-         "0.1.1"
+         "0.1.2"
 ; x-release-please-end
          "SVG-rendered tab-bar, tab-line, header-line and mode-line")
 
