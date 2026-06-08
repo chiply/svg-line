@@ -101,6 +101,28 @@ item's STATE plist. Enable the hover highlight with `svg-line-hover-highlight`
 docstring). Clicks select the window they land in, and the tab-bar's clicks and
 hover are wired up automatically when a `tab-bar` line is activated.
 
+### From existing mode-line content
+
+Mode-line content you already have — a breadcrumb header line, `which-func`, a
+VC indicator — carries `keymap`/`help-echo` text properties. Hand the
+propertized string to `svg-line-segs-from-string` and each clickable region
+becomes an interactive segment, so it renders through svg-line with its click
+and hover intact:
+
+```elisp
+(svg-line-segs-from-string (format-mode-line '(:eval (breadcrumb--header-line))))
+```
+
+## Fonts and `char-advance`
+
+svg-line positions right-aligned content, inline pies/bars, interactive
+segments and `wrap` breakpoints using `svg-line-char-advance` — the assumed
+pixel width of one character. It can't be measured (librsvg rasterises text
+with its own font stack), so it's a calibration constant. By default (`nil`) it
+is derived from the font size via `svg-line-char-advance-ratio` (0.6, a typical
+monospace), which keeps layout aligned across font sizes; pin a number for a
+specific font if right-aligned or hover content sits slightly off.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).

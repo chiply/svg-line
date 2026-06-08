@@ -93,10 +93,29 @@ nil means use the `default' face family at render time."
   "Default extra vertical padding, in pixels, added per rendered row."
   :type 'integer)
 
-(defcustom svg-line-char-advance 8
-  "Default per-character advance, in pixels, for the `wrap' layout.
-Used to decide where tab rows wrap.  Set slightly high so rows wrap
-before reaching the right edge rather than clipping."
+(defcustom svg-line-char-advance nil
+  "Per-character advance, in pixels, for run-based layout -- or nil to auto-derive.
+This is the assumed pixel width of one monospace character as librsvg renders
+the configured font at the configured size.  It positions everything the SVG
+text engine does not place by itself: right-aligned content, inline progress
+pies and bars, the hit/hover boxes of interactive `:seg' runs, and the point at
+which `wrap'-layout rows break.  (Plain all-text rows use exact font anchoring
+and ignore it.)
+
+It cannot be measured from Emacs -- librsvg rasterises text with its own font
+stack, whose metrics differ from Emacs's -- so it is a calibration constant.
+nil derives it from the font size via `svg-line-char-advance-ratio', which
+scales correctly across font sizes; set a number to pin the exact advance for
+your font (raise it if right-aligned/hover content sits too far left, lower it
+if too far right).  A spec's `:char-advance' overrides this per line."
+  :type '(choice (const :tag "Auto (font-size * ratio)" nil) number))
+
+(defcustom svg-line-char-advance-ratio 0.6
+  "Per-character advance as a fraction of the font size.
+Used to derive `svg-line-char-advance' when it (and a spec's `:char-advance')
+is nil.  0.6 suits a typical monospace font; condensed faces want less, wide
+faces more.  Deriving from the font size keeps run-based layout aligned when
+the font size changes, which a fixed pixel advance would not."
   :type 'number)
 
 (defcustom svg-line-glyph-scale 1.3
@@ -105,6 +124,14 @@ Nerd-font icon glyphs are drawn smaller than a text cell; a value >1
 enlarges just those glyphs (via a larger `<tspan>'), so icons read at a
 comparable weight to the text.  1.0 disables the effect."
   :type 'number)
+
+(defun svg-line--char-advance (explicit font-size)
+  "Resolve the per-character advance to use.
+EXPLICIT -- a spec's `:char-advance' or `svg-line-char-advance' -- wins when
+non-nil; otherwise derive it from FONT-SIZE via `svg-line-char-advance-ratio'."
+  (if explicit
+      explicit
+    (max 1 (round (* font-size svg-line-char-advance-ratio)))))
 
 (defun svg-line--glyph-char-p (ch)
   "Non-nil if CH is in a Nerd-Font / icon Private-Use code range."
@@ -454,6 +481,7 @@ left-aligned content is inset past it.  Returns an svg object."
          (background (svg-line--color background))
          (hover-color (svg-line--color hover-color))
          (fz font-size)
+         (char-advance (svg-line--char-advance char-advance fz))
          (lh (+ fz line-pad))
          (rx (max 0 (- width right-margin)))
          (height (max 1 (* lh (length rows))))
@@ -631,6 +659,60 @@ A single `lines' segment can thus emit several runs -- e.g. per-crumb
 breadcrumbs.  nil ITEMS are dropped."
   (cons :svg-segs (delq nil items)))
 
+;;;###autoload
+(defun svg-line-segs-from-string (str &optional id-prefix)
+  "Convert a propertized mode-line/header-line STR into interactive segments.
+Existing mode-line content -- a breadcrumb header line, `which-func', a VC
+indicator, ... -- already carries `keymap'/`local-map' text properties whose
+mouse-1 binding performs the click action and a `help-echo' for the tooltip.
+This splits STR into maximal regions by those map properties: a region whose
+map binds a real command to mouse-1 (looked up as `[mode-line mouse-1]',
+`[header-line mouse-1]' or `[mouse-1]') becomes an interactive `svg-line-seg'
+whose `:action' invokes that command and whose `:help' is the region's
+`help-echo' (first line); the remaining regions stay plain text.  The result is
+an `svg-line-segs' group usable as a `lines' content segment, so existing
+clickable mode-line content can be rendered by svg-line with its click and
+hover affordances intact.
+
+The click invokes the bound command with the originating mouse event, so a
+handler that reads its window/position from that event (the usual mode-line
+convention) still works.  ID-PREFIX namespaces the per-segment hover `:id's
+\(each is (ID-PREFIX . N), defaulting to (svg-line-seg . N)) -- pass a value
+unique per bar/window when several share an indicator.  Returns nil for an
+empty STR."
+  (when (and (stringp str) (> (length str) 0))
+    (let ((parts nil) (i 0) (n (length str)) (idx 0)
+          (prefix (or id-prefix 'svg-line-seg)))
+      (while (< i n)
+        (let* ((km (or (get-text-property i 'keymap str)
+                       (get-text-property i 'local-map str)))
+               (next (min (or (next-single-property-change i 'keymap str) n)
+                          (or (next-single-property-change i 'local-map str) n)))
+               (text (substring-no-properties str i next))
+               ;; `lookup-key' returns an integer (not nil) for a too-long key,
+               ;; so take the first binding that is actually `functionp'.
+               (handler (and (keymapp km)
+                             (seq-some (lambda (k)
+                                         (let ((b (lookup-key km k)))
+                                           (and (functionp b) b)))
+                                       (list [mode-line mouse-1]
+                                             [header-line mouse-1]
+                                             [mouse-1]))))
+               (he (get-text-property i 'help-echo str)))
+          (if (and handler (> (length (string-trim text)) 0))
+              (setq idx (1+ idx)
+                    parts (cons (svg-line-seg
+                                 text
+                                 :id (cons prefix idx)
+                                 :help (and (stringp he)
+                                            (substring-no-properties
+                                             (car (split-string he "\n"))))
+                                 :action handler)
+                                parts))
+            (push text parts))
+          (setq i next)))
+      (apply #'svg-line-segs (nreverse parts)))))
+
 (defun svg-line--wrap-place (items width char-advance gap lh &optional center)
   "Return placements (X TOP CW ITEM) for ITEMS in a `wrap' layout.
 WIDTH bounds each row; CHAR-ADVANCE, GAP and LH set per-item width and row
@@ -719,6 +801,7 @@ MODIFIED-FOREGROUND (and MODIFIED-BACKGROUND when set); an ordinary item whose
          (modified-background (svg-line--color modified-background))
          (hover-color (svg-line--color hover-color))
          (fz font-size)
+         (char-advance (svg-line--char-advance char-advance fz))
          (lh (+ fz line-pad))
          (placements (svg-line--wrap-place items width char-advance gap lh center))
          (height (max 1 (apply #'max lh (mapcar (lambda (p) (+ (nth 1 p) lh)) placements))))
@@ -915,7 +998,11 @@ gets a hover box.  Sizes scale with the default font (see
      :line-pad (svg-line--scaled (svg-line--opt spec :line-pad svg-line-line-pad))
      :pad (svg-line--scaled (svg-line--opt spec :pad 0))
      :right-margin (svg-line--scaled (svg-line--opt spec :right-margin 0))
-     :char-advance (* (or (svg-line--opt spec :char-advance nil) svg-line-char-advance) sc)
+     ;; nil lets `svg-line-image' derive the advance from the (scaled) font
+     ;; size; an explicit value is scaled to match.
+     :char-advance (let ((e (or (svg-line--opt spec :char-advance nil)
+                                svg-line-char-advance)))
+                     (and e (* e sc)))
      :foreground fg
      :background bg
      :hovered svg-line--hovered
@@ -948,7 +1035,9 @@ mirroring the `lines' layout."
                                               (or svg-line-font (face-attribute 'default :family nil t)))
                          :font-size (svg-line--scaled (svg-line--opt spec :font-size svg-line-font-size))
                          :line-pad (svg-line--scaled (svg-line--opt spec :line-pad svg-line-line-pad))
-                         :char-advance (* (or (svg-line--opt spec :char-advance nil) svg-line-char-advance) sc)
+                         :char-advance (let ((e (or (svg-line--opt spec :char-advance nil)
+                                                    svg-line-char-advance)))
+                                         (and e (* e sc)))
                          :gap (svg-line--opt spec :gap 3)
                          :foreground (funcall pick :foreground :inactive-foreground "#000000")
                          :background (funcall pick :background :inactive-background)
