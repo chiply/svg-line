@@ -407,5 +407,58 @@ with the modified accent so the unsaved state stays visible."
     (should-not (svg-line-active-p 'test-tb))
     (should (equal tab-bar-format '(original)))))
 
+;;;; minibuffer freeze
+
+(ert-deftest svg-line/freeze-returns-cached-during-minibuffer ()
+  "A frozen target returns the window's pre-minibuffer render while active."
+  (skip-unless (image-type-available-p 'svg))
+  (let ((calls 0))
+    (svg-line-define 'test-freeze
+      :target 'tab-line :layout 'wrap
+      :content (lambda () (cl-incf calls) (list (cons (format "tab%d" calls) t))))
+    (clrhash svg-line--freeze-cache)
+    (let ((svg-line-freeze-in-minibuffer '(tab-line)))
+      ;; render once outside a minibuffer -> cached for this window
+      (let ((first (svg-line--render 'test-freeze)))
+        (should (stringp first))
+        ;; "in a minibuffer": the cached string comes back, no re-render
+        (cl-letf (((symbol-function 'active-minibuffer-window)
+                   (lambda () (selected-window))))
+          (should (eq (svg-line--render 'test-freeze) first)))
+        (should (= calls 1))
+        ;; outside again: re-renders and refreshes the cache
+        (should-not (eq (svg-line--render 'test-freeze) first))
+        (should (= calls 2))))))
+
+(ert-deftest svg-line/freeze-disabled-target-renders-live ()
+  "A target not in `svg-line-freeze-in-minibuffer' renders normally."
+  (skip-unless (image-type-available-p 'svg))
+  (let ((calls 0))
+    (svg-line-define 'test-nofreeze
+      :target 'tab-line :layout 'wrap
+      :content (lambda () (cl-incf calls) (list (cons "t" t))))
+    (let ((svg-line-freeze-in-minibuffer nil))
+      (svg-line--render 'test-nofreeze)
+      (cl-letf (((symbol-function 'active-minibuffer-window)
+                 (lambda () (selected-window))))
+        (svg-line--render 'test-nofreeze))
+      (should (= calls 2)))))
+
+(ert-deftest svg-line/freeze-uncached-window-renders-fresh ()
+  "With no cached render for the window, a minibuffer render falls through."
+  (skip-unless (image-type-available-p 'svg))
+  (let ((calls 0))
+    (svg-line-define 'test-freeze-miss
+      :target 'tab-line :layout 'wrap
+      :content (lambda () (cl-incf calls) (list (cons "t" t))))
+    (clrhash svg-line--freeze-cache)
+    (let ((svg-line-freeze-in-minibuffer '(tab-line)))
+      (cl-letf (((symbol-function 'active-minibuffer-window)
+                 (lambda () (selected-window))))
+        (should (stringp (svg-line--render 'test-freeze-miss)))
+        (should (= calls 1))
+        ;; and it did NOT poison the cache while frozen
+        (should-not (gethash (selected-window) svg-line--freeze-cache))))))
+
 (provide 'svg-line-test)
 ;;; svg-line-test.el ends here
