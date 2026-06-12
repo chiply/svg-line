@@ -444,6 +444,30 @@ with the modified accent so the unsaved state stays visible."
         (svg-line--render 'test-nofreeze))
       (should (= calls 2)))))
 
+(ert-deftest svg-line/context-buffer-pins-content-evaluation ()
+  "Content runs with the :context-buffer current; nil/dead falls through."
+  (skip-unless (image-type-available-p 'svg))
+  (let ((ctx-buf (generate-new-buffer "ctx"))
+        (seen nil))
+    (unwind-protect
+        (progn
+          (svg-line-define 'test-ctx
+            :target 'tab-bar :layout 'lines
+            :context-buffer (lambda () ctx-buf)
+            :content (lambda ()
+                       (setq seen (current-buffer))
+                       '((("x") . nil))))
+          (with-temp-buffer
+            (svg-line--render 'test-ctx)
+            (should (eq seen ctx-buf)))
+          ;; dead context buffer falls through to the current buffer
+          (kill-buffer ctx-buf)
+          (with-temp-buffer
+            (let ((here (current-buffer)))
+              (svg-line--render 'test-ctx)
+              (should (eq seen here)))))
+      (when (buffer-live-p ctx-buf) (kill-buffer ctx-buf)))))
+
 (ert-deftest svg-line/freeze-uncached-window-renders-fresh ()
   "With no cached render for the window, a minibuffer render falls through."
   (skip-unless (image-type-available-p 'svg))
