@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/chiply/svg-line/compare/v0.1.2...v0.1.3) (2026-06-12)
+
+
+### Features
+
+* row-spanning overlays (:spans) — clock, pie, flank, vector image ([#6](https://github.com/chiply/svg-line/issues/6)) ([11721ed](https://github.com/chiply/svg-line/commit/11721ed36265683f66bb84ab9c4fe76c061438d3))
+
 ## [0.1.2](https://github.com/chiply/svg-line/compare/v0.1.1...v0.1.2) (2026-06-08)
 
 
