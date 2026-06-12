@@ -397,15 +397,19 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                     (hov (and hover-color hovered id (equal id hovered)))
                     (col (plist-get plist :color))
                     (face (plist-get plist :face))
+                    (bg (plist-get plist :bg))        ; persistent background pill
+                    (weight (plist-get plist :weight)) ; e.g. `bold'
                     (fill (cond (col (svg-line--color col))
                                 (face (svg-line--color
                                        (face-foreground face nil 'default)))
                                 (t foreground))))
+               (when bg
+                 (svg-rectangle svg x top cw lh :fill (svg-line--color bg) :rx 3))
                (when hov
                  (svg-rectangle svg x top cw lh :fill hover-color :rx 3))
                (when (> (length str) 0)
                  (svg-line--add-text svg str :x x :y (+ top fz)
-                                     :font font :font-size fz :fill fill))
+                                     :font font :font-size fz :fill fill :weight weight))
                (push (list x top cw (cons str plist)) svg-line--seg-acc)))
       (:pie  (let* ((frac (max 0.0 (min 1.0 (float (nth 1 run)))))
                     (fill (svg-line--color (or (nth 2 run) foreground)))
@@ -415,19 +419,7 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                     ;; run end, so a rightmost pie sits flush at the margin.
                     (cx (+ x (round (* 0.3 fz)) r))
                     (cy (+ top (/ lh 2.0))))
-               (svg-circle svg cx cy r :fill bg)
-               (if (>= frac 0.999)
-                   (svg-circle svg cx cy r :fill fill)
-                 (when (> frac 0.001)
-                   (let* ((theta (* 2 float-pi frac))
-                          (ex (+ cx (* r (sin theta))))
-                          (ey (- cy (* r (cos theta))))
-                          (large (if (> frac 0.5) 1 0)))
-                     (dom-append-child
-                      svg (dom-node 'path
-                                    (list (cons 'd (format "M %g %g L %g %g A %g %g 0 %d 1 %g %g Z"
-                                                           cx cy cx (- cy r) r r large ex ey))
-                                          (cons 'fill fill)))))))))
+               (svg-line--draw-pie-at svg cx cy r frac fill bg)))
       (:bar  (let* ((frac (max 0.0 (min 1.0 (float (nth 1 run)))))
                     (bw (nth 2 run))
                     (fill (or (nth 3 run) foreground))
@@ -439,6 +431,91 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                               :fill (svg-line--color fill) :rx 2))))
     (setq x (+ x (svg-line--run-width run char-advance fz))))
   x)
+
+(defun svg-line--draw-pie-at (svg cx cy r frac fill bg)
+  "Draw a progress pie on SVG centred at CX,CY radius R for FRAC in [0,1].
+FILL and BG are already-resolved colours."
+  (svg-circle svg cx cy r :fill bg)
+  (if (>= frac 0.999)
+      (svg-circle svg cx cy r :fill fill)
+    (when (> frac 0.001)
+      (let* ((theta (* 2 float-pi frac))
+             (ex (+ cx (* r (sin theta))))
+             (ey (- cy (* r (cos theta))))
+             (large (if (> frac 0.5) 1 0)))
+        (dom-append-child
+         svg (dom-node 'path
+                       (list (cons 'd (format "M %g %g L %g %g A %g %g 0 %d 1 %g %g Z"
+                                              cx cy cx (- cy r) r r large ex ey))
+                             (cons 'fill fill))))))))
+
+(defun svg-line--draw-clock (svg cx cy r color &optional accent)
+  "Draw an analog clock face on SVG centred at CX,CY radius R, showing now.
+COLOR is the rim/ticks/hour-hand colour; ACCENT (or COLOR) the minute hand."
+  (let* ((tm (decode-time))
+         (mn (decoded-time-minute tm))
+         (hr (mod (decoded-time-hour tm) 12))
+         (ma (* (/ mn 60.0) 2 float-pi))
+         (ha (* (/ (+ hr (/ mn 60.0)) 12.0) 2 float-pi))
+         (col (svg-line--color color))
+         (acc (svg-line--color (or accent color))))
+    (cl-flet ((hand (ang len w c)
+                (svg-line svg cx cy (round (+ cx (* len (sin ang))))
+                          (round (- cy (* len (cos ang))))
+                          :stroke c :stroke-width w :stroke-linecap "round")))
+      (svg-circle svg cx cy r :fill "none" :stroke col
+                  :stroke-width (max 1 (round (* r 0.09))))
+      (dotimes (i 12)
+        (let* ((a (* (/ i 12.0) 2 float-pi)) (r1 (* r 0.80)) (r2 (* r 0.93)))
+          (svg-line svg (round (+ cx (* r1 (sin a)))) (round (- cy (* r1 (cos a))))
+                    (round (+ cx (* r2 (sin a)))) (round (- cy (* r2 (cos a))))
+                    :stroke col :stroke-width (max 1 (round (* r 0.055))))))
+      (hand ha (* r 0.50) (max 1 (round (* r 0.14))) col)
+      (hand ma (* r 0.80) (max 1 (round (* r 0.09))) acc)
+      (svg-circle svg cx cy (max 1 (round (* r 0.09))) :fill acc))))
+
+(defun svg-line--svg-intrinsic-size (svg-string)
+  "Parse (WIDTH . HEIGHT) in px from an SVG STRING's root element.
+Defaults each dimension to 1 if absent."
+  (cons (if (string-match "\\bwidth=\"\\([0-9.]+\\)" svg-string)
+            (max 1 (round (string-to-number (match-string 1 svg-string)))) 1)
+        (if (string-match "\\bheight=\"\\([0-9.]+\\)" svg-string)
+            (max 1 (round (string-to-number (match-string 1 svg-string)))) 1)))
+
+(defun svg-line--embed-image (svg data x y w h)
+  "Embed SVG markup DATA as a base64 data-URI <image> on SVG at X,Y sized W*H.
+Rasterised by librsvg at W*H, so it can soften under further scaling -- prefer
+`svg-line--splice-svg' for SVG payloads, which stays vector and renders sharp."
+  (dom-append-child
+   svg (dom-node 'image
+                 (list (cons 'x x) (cons 'y y) (cons 'width w) (cons 'height h)
+                       (cons 'href (concat "data:image/svg+xml;base64,"
+                                           (base64-encode-string
+                                            (encode-coding-string data 'utf-8) t)))))))
+
+(defun svg-line--attr-num (v)
+  "Coerce an SVG attribute V (number or string) to a number; default 1."
+  (cond ((numberp v) v) ((stringp v) (string-to-number v)) (t 1)))
+
+(defun svg-line--parse-svg (s)
+  "Parse SVG string S into an svg.el DOM root node, or nil."
+  (and (stringp s)
+       (ignore-errors
+         (with-temp-buffer (insert s)
+           (libxml-parse-xml-region (point-min) (point-max))))))
+
+(defun svg-line--splice-svg (svg dom x y scale)
+  "Splice DOM's children into SVG under a translate(X,Y) scale(SCALE) group.
+Keeps everything vector (renders sharp at device resolution), unlike a
+rasterised <image>."
+  (let ((g (dom-node 'g (list (cons 'transform
+                                    (format "translate(%d,%d) scale(%g)" x y scale))))))
+    ;; Deep-copy each child: DOM may be a cached/shared node (e.g. a daily
+    ;; date widget reused across renders), and splicing its child cons cells
+    ;; into another tree aliases them.  copy-tree keeps the splice fully
+    ;; independent of the caller's DOM.
+    (dolist (c (dom-children dom)) (dom-append-child g (copy-tree c)))
+    (dom-append-child svg g)))
 
 ;;;###autoload
 (cl-defun svg-line-image (rows &key
@@ -456,7 +533,8 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                                (icon nil)
                                (icon-color nil)
                                (icon-width nil)
-                               (icon-scale 0.74))
+                               (icon-scale 0.74)
+                               (spans nil))
   "Build a `lines'-layout SVG from ROWS.
 Each ROW is either a cons (LEFT . RIGHT) -- left- and right-aligned content --
 or a vector [LEFT CENTER RIGHT] which adds horizontally-centred content.
@@ -558,6 +636,86 @@ left-aligned content is inset past it.  Returns an svg object."
                       (svg-line--draw-runs svg rr (max pad (- rx (svg-line--runs-width rr char-advance fz)))
                                            top fz lh font char-advance foreground
                                            hovered hover-color))))))
+    ;; Centred, row-spanning overlays drawn once over a row range, on top of
+    ;; the rows (whose `:center' should be empty there to avoid collision).
+    ;; SPEC: (:clock (ROW-A . ROW-B) COLOR ACCENT) or
+    ;;       (:pie   (ROW-A . ROW-B) FRACTION FILL BG).  Rows 0-indexed, inclusive.
+    (dolist (span spans)
+      (when (consp span)
+        (let* ((rng (nth 1 span))
+               (a (if (consp rng) (car rng) 0))
+               (b (if (consp rng) (cdr rng) (1- (length rows))))
+               (sh (* lh (1+ (- b a))))
+               (cx (/ width 2))
+               (cy (round (+ (* lh a) (/ sh 2.0))))
+               (r (max 3 (round (* (/ sh 2.0) 0.86)))))
+          (pcase (car span)
+            (:clock (svg-line--draw-clock svg cx cy r (or (nth 2 span) foreground)
+                                          (nth 3 span)))
+            (:pie   (svg-line--draw-pie-at svg cx cy r
+                                           (max 0.0 (min 1.0 (float (nth 2 span))))
+                                           (svg-line--color (or (nth 3 span) foreground))
+                                           (svg-line--color (or (nth 4 span) "#d4dcea"))))
+            ;; (:image (ROW-A . ROW-B) IMAGE-OR-SVG &optional ALIGN GAP)
+            ;; IMAGE-OR-SVG: an Emacs image (its :data, an SVG string) or a raw
+            ;; SVG string.  Scaled to the span height, aligned left/center/right.
+            ;; (:image (ROW-A . ROW-B) SVG &optional ALIGN GAP)
+            ;; SVG: an svg.el DOM node, a raw SVG string, or an Emacs image whose
+            ;; :data is SVG.  Spliced as vectors (sharp), scaled to span height.
+            ;; (:flank (ROW-A . ROW-B) LEFT RIGHT &optional COLOR GAP GLYPH-SIZE)
+            ;; Two text clusters flanking the centred clock/pie, baseline
+            ;; centred on the span, drawn in the bar font so Nerd-Font glyphs
+            ;; resolve.  LEFT sits just left of the overlay (right-anchored),
+            ;; RIGHT just right (left-anchored).  Each side is either a STRING
+            ;; (drawn whole at FONT-SIZE) or a (TIME . GLYPH) cons -- the GLYPH
+            ;; is drawn nearest the clock at GLYPH-SIZE (default 1.7*FONT-SIZE,
+            ;; so squat Nerd-Font weather/icon glyphs read at text scale) and
+            ;; TIME sits on its outer side at FONT-SIZE.
+            (:flank
+             (let* ((left (nth 2 span))
+                    (right (nth 3 span))
+                    (col (svg-line--color (or (nth 4 span) foreground)))
+                    (gap (or (nth 5 span) (round (* fz 0.6))))
+                    (gsz (or (nth 6 span) (round (* fz 1.7))))
+                    (gw (round (* gsz 0.5)))       ; Terminess Mono glyph advance ~0.5em
+                    (tgap (max 1 (round (* fz 0.1))))
+                    (tyt (round (+ cy (* fz 0.36))))
+                    (tyg (round (+ cy (* gsz 0.36))))
+                    (xl (- cx r gap)) (xr (+ cx r gap)))
+               (cl-flet ((txt (s x y sz anchor)
+                           (when (and (stringp s) (> (length s) 0))
+                             (svg-text svg s :x x :y y :text-anchor anchor
+                                       :font-family font :font-size sz :fill col))))
+                 ;; LEFT: TIME (outer) then GLYPH (inner, nearest clock).
+                 (if (consp left)
+                     (progn (txt (cdr left) xl tyg gsz "end")
+                            (txt (car left) (- xl gw tgap) tyt fz "end"))
+                   (txt left xl tyt fz "end"))
+                 ;; RIGHT: GLYPH (inner, nearest clock) then TIME (outer).
+                 (if (consp right)
+                     (progn (txt (cdr right) xr tyg gsz "start")
+                            (txt (car right) (+ xr gw tgap) tyt fz "start"))
+                   (txt right xr tyt fz "start")))))
+            (:image
+             (let* ((v (nth 2 span))
+                    (align (or (nth 3 span) 'center))
+                    (gap (or (nth 4 span) 0))
+                    (dom (cond ((and (consp v) (eq (car v) 'svg)) v)
+                               ((stringp v) (svg-line--parse-svg v))
+                               ((and (consp v) (eq (car v) 'image))
+                                (svg-line--parse-svg (plist-get (cdr v) :data))))))
+               (when (and (consp dom) (eq (car dom) 'svg))
+                 (let* ((attrs (cadr dom))
+                        (iw (max 1 (round (svg-line--attr-num (cdr (assq 'width attrs))))))
+                        (ih (max 1 (round (svg-line--attr-num (cdr (assq 'height attrs))))))
+                        (scale (/ (float sh) ih))
+                        (dw (max 1 (round (* iw scale))))
+                        (ix (pcase align
+                              ('left (+ pad gap))
+                              ('right (max pad (- width dw gap)))
+                              (_ (round (- cx (/ dw 2.0))))))
+                        (iy (round (- cy (/ sh 2.0)))))
+                   (svg-line--splice-svg svg dom ix iy scale)))))))))
     (setq svg-line--lines-placements (nreverse svg-line--seg-acc)
           svg-line--lines-lh lh)
     svg))
@@ -1034,7 +1192,9 @@ gets a hover box.  Sizes scale with the default font (see
                      (svg-line--opt spec :icon-color))
      :icon-width (let ((w (svg-line--opt spec :icon-width)))
                    (if (eq w 'square) 'square (and (numberp w) (svg-line--scaled w))))
-     :icon-scale (svg-line--opt spec :icon-scale 0.74))))
+     :icon-scale (svg-line--opt spec :icon-scale 0.74)
+     :spans (let ((s (svg-line--opt spec :spans)))
+              (if (functionp s) (funcall s) s)))))
 
 (defun svg-line--build-wrap (spec)
   "Build the `wrap' layout for SPEC, returning (SVG . MAP).
