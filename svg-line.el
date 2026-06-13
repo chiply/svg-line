@@ -741,6 +741,25 @@ machinery.  See the tab-line config."
   "Face applied to an interactive item's hover help, or nil to leave it unstyled."
   :type '(choice (const :tag "No face" nil) face))
 
+(defcustom svg-line-freeze-in-minibuffer '(tab-line)
+  "Targets whose windows keep their last render while a minibuffer is active.
+Completion sessions preview candidate buffers by swapping them into a
+window (consult, embark, ...).  Each swap perturbs a per-window bar --
+most visibly a `wrap' tab-line, which gains the preview buffer as a tab
+and can re-flow onto a different number of rows, so the bar pops taller
+and shorter as the user moves through candidates.  While a minibuffer is
+active, a target listed here keeps showing the display string it last
+rendered for that window OUTSIDE the minibuffer; normal rendering
+resumes the moment the minibuffer closes.  Set to nil to disable."
+  :type '(repeat (choice (const tab-line) (const header-line)
+                         (const mode-line) (const tab-bar))))
+
+(defvar svg-line--freeze-cache (make-hash-table :test 'eq :weakness 'key)
+  "WINDOW -> alist of (NAME . DISPLAY-STRING) from the last unfrozen render.
+Weak on the window, so entries die with their windows.  Read (instead of
+rendering) while a minibuffer is active for targets in
+`svg-line-freeze-in-minibuffer'; written on every render outside one.")
+
 (defface svg-line-help '((t :inherit highlight))
   "Face for an interactive item's hover help (its `help-echo').
 With tooltips off the help shows in the echo area, where this contrasting
@@ -1364,21 +1383,42 @@ drawn into the SVG itself from `svg-line--hovered'.)"
     str))
 
 (defun svg-line--render (name)
-  "Render line NAME to a display string (error/loop guarded)."
+  "Render line NAME to a display string (error/loop guarded).
+For a target in `svg-line-freeze-in-minibuffer', returns the window's
+last non-minibuffer render while a minibuffer is active (redisplay
+evaluates a window's format with that window selected, so
+`selected-window' identifies it)."
   (svg-line-safe
    name
    (lambda ()
-     (let ((spec (svg-line--spec name)))
-       (if (eq (or (plist-get spec :layout) 'lines) 'wrap)
-           (let ((str (svg-line-display (car (svg-line--build-wrap spec)))))
-             (svg-line--store-placements name svg-line--wrap-lh svg-line--wrap-placements)
-             ;; the whole wrap line is tabs, so a hand pointer everywhere fits
-             (svg-line--interactive str name (and svg-line--wrap-placements t) 'hand))
-         (let ((svg (svg-line--build-lines spec)))
-           (svg-line--store-placements name svg-line--lines-lh svg-line--lines-placements)
-           ;; a lines bar has large non-interactive gaps, so no global pointer
-           (svg-line--interactive (svg-line-display svg) name
-                                  (and svg-line--lines-placements t))))))))
+     (let* ((spec (svg-line--spec name))
+            (freezable (memq (plist-get spec :target)
+                             svg-line-freeze-in-minibuffer))
+            (win (and freezable (selected-window)))
+            (in-mini (and freezable (active-minibuffer-window)))
+            (ctx (svg-line--opt spec :context-buffer)))
+       (or (and in-mini win
+                (cdr (assq name (gethash win svg-line--freeze-cache))))
+           (let ((str
+                  ;; :context-buffer pins content evaluation to a stable
+                  ;; buffer -- e.g. a frame bar whose buffer-dependent
+                  ;; segments would otherwise flip as completion previews
+                  ;; swap the selected window's buffer, repainting the bar
+                  ;; with alternating images (a visible flash).
+                  (with-current-buffer (if (buffer-live-p ctx) ctx (current-buffer))
+                    (if (eq (or (plist-get spec :layout) 'lines) 'wrap)
+                        (let ((s (svg-line-display (car (svg-line--build-wrap spec)))))
+                          (svg-line--store-placements name svg-line--wrap-lh svg-line--wrap-placements)
+                          ;; the whole wrap line is tabs, so a hand pointer everywhere fits
+                          (svg-line--interactive s name (and svg-line--wrap-placements t) 'hand))
+                      (let ((svg (svg-line--build-lines spec)))
+                        (svg-line--store-placements name svg-line--lines-lh svg-line--lines-placements)
+                        ;; a lines bar has large non-interactive gaps, so no global pointer
+                        (svg-line--interactive (svg-line-display svg) name
+                                               (and svg-line--lines-placements t)))))))
+             (when (and win (not in-mini) (window-live-p win))
+               (setf (alist-get name (gethash win svg-line--freeze-cache)) str))
+             str))))))
 
 (defun svg-line--renderer (name)
   "Return (creating if needed) the named renderer function symbol for NAME."
@@ -1490,6 +1530,13 @@ Recognised SPEC keys:
              - for `wrap':  a list of (LABEL . STATE), where STATE is a
                CURRENTP atom or a plist with `:current'/`:modified' keys
   :width   `frame', `window', an integer, or a function (default by target)
+  :context-buffer  a function returning a buffer to make current while
+           evaluating :content, or nil for the buffer current at render
+           time.  Pins a frame-level bar's buffer-dependent segments to
+           a stable context -- e.g. the buffer the user came from --
+           while a minibuffer session previews other buffers, which
+           would otherwise flip the segments (and repaint the bar with
+           alternating images) on every preview.
   :font :font-size :line-pad :pad :right-margin :char-advance
   :foreground :background
   :active   a predicate; when present and false, inactive variants apply
