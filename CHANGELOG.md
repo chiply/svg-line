@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/chiply/svg-line/compare/v0.1.3...v0.1.4) (2026-06-13)
+
+
+### Features
+
+* freeze per-window rendering during minibuffer sessions ([#8](https://github.com/chiply/svg-line/issues/8)) ([182088b](https://github.com/chiply/svg-line/commit/182088b45c88c5d22044ecca5ea682c7ad85a76d))
+
 ## [0.1.3](https://github.com/chiply/svg-line/compare/v0.1.2...v0.1.3) (2026-06-12)
 
 

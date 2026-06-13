@@ -6,7 +6,7 @@
 ;; Maintainer: Charlie Holland <mister.chiply@gmail.com>
 ;; URL: https://github.com/chiply/svg-line
 ;; x-release-please-start-version
-;; Version: 0.1.3
+;; Version: 0.1.4
 ;; x-release-please-end
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, faces, frames
