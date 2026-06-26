@@ -970,6 +970,7 @@ property so `svg-line--note-help' can track which item the mouse is over."
                                      (current-background nil)
                                      (modified-foreground nil)
                                      (modified-background nil)
+                                     (tab-background nil)
                                      (hovered nil)
                                      (hover-color nil)
                                      (center nil))
@@ -989,14 +990,18 @@ STATE selects how each item is styled and made interactive:
 
 A current item is drawn bold over CURRENT-BACKGROUND; a modified item uses
 MODIFIED-FOREGROUND (and MODIFIED-BACKGROUND when set); an ordinary item whose
-`:id' equals HOVERED gets a HOVER-COLOR box.  Items with `:help'/`:action'/
-`:menu' become image map hot-spots (per-item help-echo + hand pointer)."
+`:id' equals HOVERED gets a HOVER-COLOR box, and any other ordinary item gets a
+TAB-BACKGROUND box when that is non-nil (so inactive tabs can be delineated like
+the built-in tab line; nil leaves them transparent).  Items with
+`:help'/`:action'/`:menu' become image map hot-spots (per-item help-echo + hand
+pointer)."
   (let* ((foreground (svg-line--color foreground))
          (background (svg-line--color background))
          (current-foreground (svg-line--color current-foreground))
          (current-background (svg-line--color current-background))
          (modified-foreground (svg-line--color modified-foreground))
          (modified-background (svg-line--color modified-background))
+         (tab-background (svg-line--color tab-background))
          (hover-color (svg-line--color hover-color))
          (fz font-size)
          (char-advance (svg-line--char-advance char-advance fz))
@@ -1017,7 +1022,8 @@ MODIFIED-FOREGROUND (and MODIFIED-BACKGROUND when set); an ordinary item whose
                (box  (cond ((and currentp modifiedp) (or modified-foreground current-background))
                            (currentp  current-background)
                            (modifiedp modified-background)
-                           (hoveredp  hover-color)))
+                           (hoveredp  hover-color)
+                           (t tab-background)))
                (fill (cond (currentp  (or current-foreground foreground))
                            (modifiedp (or modified-foreground foreground))
                            (t foreground))))
@@ -1245,6 +1251,7 @@ mirroring the `lines' layout."
                          :current-background (funcall pick :current-background :inactive-current-background)
                          :modified-foreground (funcall pick :modified-foreground :inactive-modified-foreground)
                          :modified-background (funcall pick :modified-background :inactive-modified-background)
+                         :tab-background (funcall pick :tab-background :inactive-tab-background)
                          :hovered svg-line--hovered
                          :hover-color (or (svg-line--opt spec :hover-color)
                                           (face-background 'highlight nil 'default)
@@ -1545,8 +1552,11 @@ Recognised SPEC keys:
   :gap
   :current-foreground :current-background
   :modified-foreground :modified-background
+  :tab-background   box behind every ordinary (non-current) tab, to delineate
+                    inactive tabs like the built-in tab line (nil = transparent)
   :inactive-current-foreground :inactive-current-background
   :inactive-modified-foreground :inactive-modified-background
+  :inactive-tab-background
 Each styling value may be a literal or a zero-arg function,
 evaluated on every render."
   (unless (plist-get spec :target)
