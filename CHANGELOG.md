@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/chiply/svg-line/compare/v0.1.4...v0.1.5) (2026-06-26)
+
+
+### Features
+
+* add :tab-background for delineating inactive wrap tabs ([#10](https://github.com/chiply/svg-line/issues/10)) ([98d28e6](https://github.com/chiply/svg-line/commit/98d28e6b89d6ba6c8952097dbf48991ad7b620be))
+
 ## [0.1.4](https://github.com/chiply/svg-line/compare/v0.1.3...v0.1.4) (2026-06-13)
 
 
