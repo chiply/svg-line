@@ -1451,6 +1451,11 @@ evaluates a window's format with that window selected, so
   "Repeating timer driving tab-bar hover; nil when not running.")
 (defvar svg-line--tab-bar-hover-was-over nil
   "Non-nil if the last poll found the pointer over a tab-bar item.")
+(defvar svg-line--tab-bar-hover-last nil
+  "(ID . TEXT) of the help last fed to `show-help-function' by the poll.
+Used to skip repeats: re-showing identical help every poll repaints the
+echo area, and each repaint re-runs every mode-line's :eval -- an 8 Hz
+redisplay treadmill for as long as the pointer rests on the tab bar.")
 
 (defun svg-line--tab-bar-item-at (posn)
   "Return the interactive item under POSN for any active tab-bar svg-line, or nil."
@@ -1483,7 +1488,10 @@ with EVENT and ARGS (the default tab-bar context menu)."
 The tab bar gives no per-position help-echo, so we poll: when the pointer is
 over a tab-bar item, feed its (tagged) help through `show-help-function' -- the
 same path the per-window bars use -- which shows the echo cue and sets the
-hovered id; on leaving, clear it once."
+hovered id; on leaving, clear it once.  Help is only re-fed when the hovered
+item or its text actually changes (`svg-line--tab-bar-hover-last'): calling
+`show-help-function' with the same help every poll repaints the echo area,
+which re-evaluates every mode-line each cycle."
   (when (and svg-line-hover-highlight svg-line--tab-bar-lines
              (functionp show-help-function))
     (let* ((mp (mouse-pixel-position))
@@ -1495,11 +1503,17 @@ hovered id; on leaving, clear it once."
            (help (and item (svg-line--tab-help item))))
       (cond
        (over
-        (ignore-errors (funcall show-help-function help))
+        (let ((key (cons (and (stringp help) (> (length help) 0)
+                              (get-text-property 0 'svg-line-tab help))
+                         (and (stringp help) (substring-no-properties help)))))
+          (unless (equal key svg-line--tab-bar-hover-last)
+            (setq svg-line--tab-bar-hover-last key)
+            (ignore-errors (funcall show-help-function help))))
         (setq svg-line--tab-bar-hover-was-over t))
        (svg-line--tab-bar-hover-was-over
         (ignore-errors (funcall show-help-function nil))
-        (setq svg-line--tab-bar-hover-was-over nil))))))
+        (setq svg-line--tab-bar-hover-was-over nil
+              svg-line--tab-bar-hover-last nil))))))
 
 (defun svg-line--tab-bar-enable ()
   "Enable tab-bar click/hover interactivity (idempotent)."
@@ -1517,7 +1531,8 @@ hovered id; on leaving, clear it once."
     (when (timerp svg-line--tab-bar-hover-timer)
       (cancel-timer svg-line--tab-bar-hover-timer))
     (setq svg-line--tab-bar-hover-timer nil
-          svg-line--tab-bar-hover-was-over nil)))
+          svg-line--tab-bar-hover-was-over nil
+          svg-line--tab-bar-hover-last nil)))
 
 ;;;; Definition + activation
 ;; ----------------------------------------------------------------
