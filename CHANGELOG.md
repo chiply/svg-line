@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/chiply/svg-line/compare/v0.1.5...v0.1.6) (2026-07-21)
+
+
+### Bug Fixes
+
+* re-feed tab-bar hover help only when the hovered item changes ([#12](https://github.com/chiply/svg-line/issues/12)) ([8c45f92](https://github.com/chiply/svg-line/commit/8c45f92319da55e17217180f7b22624bf1aeadc1))
+
 ## [0.1.5](https://github.com/chiply/svg-line/compare/v0.1.4...v0.1.5) (2026-06-26)
 
 
