@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/chiply/svg-line/compare/v0.1.6...v0.1.7) (2026-09-04)
+
+
+### Features
+
+* :pad/:pad-y/:margin/:margin-y spacing for both layouts ([#14](https://github.com/chiply/svg-line/issues/14)) ([b953290](https://github.com/chiply/svg-line/commit/b9532903c8ff0c73228fbff84d55a46b23946b43))
+
 ## [0.1.6](https://github.com/chiply/svg-line/compare/v0.1.5...v0.1.6) (2026-07-21)
 
 
