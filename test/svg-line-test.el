@@ -486,3 +486,91 @@ with the modified accent so the unsaved state stays visible."
 
 (provide 'svg-line-test)
 ;;; svg-line-test.el ends here
+
+;;;; Spacing: margin (outside the background) vs padding (inside it)
+
+(ert-deftest svg-line/pad-y-normalises ()
+  "PAD-Y takes a number (both ends) or a cons (TOP . BOTTOM)."
+  (should (equal (svg-line--pad-y 5) '(5 . 5)))
+  (should (equal (svg-line--pad-y '(2 . 7)) '(2 . 7)))
+  (should (equal (svg-line--pad-y nil) '(0 . 0))))
+
+(ert-deftest svg-line/spacing-defaults-are-a-no-op ()
+  "With every spacing option at 0 the image is what it was without them."
+  (let ((rows '(("l" . "r") ("l2" . "r2"))))
+    (should (= (dom-attr (svg-line-image rows :width 200 :font-size 10 :line-pad 4)
+                         'height)
+               (dom-attr (svg-line-image rows :width 200 :font-size 10 :line-pad 4
+                                         :pad 0 :pad-y 0 :margin 0 :margin-y 0)
+                         'height)))))
+
+(ert-deftest svg-line/lines-margin-y-and-pad-y-both-add-height ()
+  "Both insets grow the image; only PAD-Y is covered by the background."
+  (let* ((rows '(("l" . "r") ("l2" . "r2")))
+         (lh (+ 10 4))
+         (base (svg-line-image rows :width 200 :font-size 10 :line-pad 4))
+         (padded (svg-line-image rows :width 200 :font-size 10 :line-pad 4
+                                 :pad-y 3 :margin-y 5 :background "#123456"))
+         (bg (car (dom-by-tag padded 'rect))))
+    (should (= (dom-attr base 'height) (* 2 lh)))
+    (should (= (dom-attr padded 'height) (+ (* 2 lh) 6 10)))
+    ;; the background starts below the margin and covers rows + padding only
+    (should (= 5 (dom-attr bg 'y)))
+    (should (= (+ (* 2 lh) 6) (dom-attr bg 'height)))))
+
+(ert-deftest svg-line/lines-margin-narrows-the-background ()
+  "MARGIN insets the painted background from both side edges."
+  (let ((bg (car (dom-by-tag (svg-line-image '(("l" . "r")) :width 200 :font-size 10
+                                             :margin 20 :background "#123456")
+                             'rect))))
+    (should (= 20 (dom-attr bg 'x)))
+    (should (= 160 (dom-attr bg 'width)))))
+
+(ert-deftest svg-line/lines-uneven-pad-y ()
+  "A cons PAD-Y pads the two ends differently."
+  (let* ((img (svg-line-image '(("l" . "r")) :width 200 :font-size 10 :line-pad 4
+                              :pad-y '(2 . 9) :background "#123456"))
+         (bg (car (dom-by-tag img 'rect))))
+    (should (= (+ 14 2 9) (dom-attr img 'height)))
+    (should (= 0 (dom-attr bg 'y)))))
+
+(ert-deftest svg-line/wrap-pad-and-margin-place-items ()
+  "In `wrap\='), X0 is MARGIN+PAD and rows start at MARGIN-Y+PAD-Y."
+  (let ((p (car (svg-line--wrap-place (list (cons "aa" nil)) 1000 8 1 14 nil 30 970 7))))
+    (should (= 30 (nth 0 p)))
+    (should (= 7 (nth 1 p)))))
+
+(ert-deftest svg-line/wrap-pad-y-lets-pills-float ()
+  "PAD-Y leaves background above and below the row, so item boxes float in it."
+  (let* ((img (svg-line-wrap-image (list (cons "aa" t)) :width 200 :font-size 10
+                                   :line-pad 4 :pad-y 4 :margin-y 2
+                                   :background "#123456" :current-background "#abcdef"))
+         (rects (dom-by-tag img 'rect))
+         (bg (car rects))
+         (pill (cadr rects)))
+    (should (= (+ 14 8 4) (dom-attr img 'height)))
+    (should (= 2 (dom-attr bg 'y)))
+    ;; the pill sits strictly inside the background block
+    (should (> (dom-attr pill 'y) (dom-attr bg 'y)))
+    (should (< (+ (dom-attr pill 'y) (dom-attr pill 'height))
+               (+ (dom-attr bg 'y) (dom-attr bg 'height))))))
+
+(ert-deftest svg-line/wrap-margin-narrows-the-background ()
+  "MARGIN narrows the wrap background and the flow is centred in what remains."
+  (let ((bg (car (dom-by-tag (svg-line-wrap-image (list (cons "aa" nil)) :width 200
+                                                  :font-size 10 :margin 25
+                                                  :background "#123456")
+                             'rect))))
+    (should (= 25 (dom-attr bg 'x)))
+    (should (= 150 (dom-attr bg 'width)))))
+
+(ert-deftest svg-line/window-width-excludes-divider ()
+  "The bar width drops the right divider, which `window-pixel-width\=' includes."
+  (cl-letf (((symbol-function 'window-pixel-width) (lambda (&rest _) 500))
+            ((symbol-function 'window-right-divider-width) (lambda (&rest _) 30))
+            ((symbol-function 'window-scroll-bar-width) (lambda (&rest _) 0)))
+    (should (= 470 (svg-line--window-width))))
+  (cl-letf (((symbol-function 'window-pixel-width) (lambda (&rest _) 500))
+            ((symbol-function 'window-right-divider-width) (lambda (&rest _) 0))
+            ((symbol-function 'window-scroll-bar-width) (lambda (&rest _) 0)))
+    (should (= 500 (svg-line--window-width)))))

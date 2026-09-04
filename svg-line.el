@@ -524,6 +524,9 @@ rasterised <image>."
                                (font-size svg-line-font-size)
                                (line-pad svg-line-line-pad)
                                (pad 0)
+                               (pad-y 0)
+                               (margin 0)
+                               (margin-y 0)
                                (right-margin 0)
                                (char-advance svg-line-char-advance)
                                (foreground "#000000")
@@ -546,8 +549,15 @@ Each of LEFT, CENTER and RIGHT is either:
     (:pie FRACTION FILL BG), (:bar FRACTION PIXELWIDTH FILL BG) or
     (:seg STR PLIST); see `svg-line--render-runs'.
 FONT, FONT-SIZE, LINE-PAD, PAD, FOREGROUND and BACKGROUND set the text
-family, size, per-row vertical padding, left inset and colours.  An
-interactive (:seg ...) run whose `:id' equals HOVERED gets a HOVER-COLOR
+family, size, per-row vertical padding, left inset and colours.  PAD-Y insets
+the rows from the top AND bottom of the image, which LINE-PAD cannot do: that
+one grows the space BELOW each row, so it separates rows and pads the bottom
+but never the top.  PAD-Y is the vertical partner to PAD, and is either a
+number (both ends) or a cons (TOP . BOTTOM) -- the asymmetric form is how a
+bar gets clear space on the side facing its neighbour without an equal gap
+on the far side.  BACKGROUND is painted only behind the ROWS, never behind
+PAD-Y, so the inset reads as space between bars rather than as more bar.
+An interactive (:seg ...) run whose `:id' equals HOVERED gets a HOVER-COLOR
 box; the placements of all such runs are left in `svg-line--lines-placements'
 \(with row height in `svg-line--lines-lh') for click/hover hit-testing.
 ICON, when non-nil, is a (usually Nerd-Font) glyph drawn ONCE at the left
@@ -561,9 +571,25 @@ left-aligned content is inset past it.  Returns an svg object."
          (fz font-size)
          (char-advance (svg-line--char-advance char-advance fz))
          (lh (+ fz line-pad))
-         (rx (max 0 (- width right-margin)))
-         (height (max 1 (* lh (length rows))))
-         (isz (and icon (max 1 (round (* height icon-scale)))))
+         (rx (max 0 (- width margin right-margin)))
+         ;; CH is the rows' own height; HEIGHT adds the vertical inset.  The
+         ;; masthead icon is sized and centred on CH, not HEIGHT, so padding
+         ;; the image does not inflate the icon along with it.
+         (pad-y (svg-line--pad-y pad-y))
+         (pad-top (car pad-y))
+         (pad-bot (cdr pad-y))
+         (margin-y (svg-line--pad-y margin-y))
+         (mtop (car margin-y))
+         (mbot (cdr margin-y))
+         (ch (max 1 (* lh (length rows))))
+         ;; BG-H is the painted block: the rows plus their PADDING.  MARGIN-Y
+         ;; sits outside it and is never painted, so it reads as space between
+         ;; this bar and its neighbour rather than as more bar.
+         (bg-h (+ pad-top ch pad-bot))
+         (height (max 1 (+ mtop bg-h mbot)))
+         (rows-y (+ mtop pad-top))
+         (x0 (+ margin pad))
+         (isz (and icon (max 1 (round (* ch icon-scale)))))
          ;; Reserved icon width.  `square' reserves the full image height (a
          ;; square cell); an integer reserves that many pixels; otherwise
          ;; reserve only ~the ink width plus a small margin -- Nerd-Font icon
@@ -571,13 +597,19 @@ left-aligned content is inset past it.  Returns an svg object."
          ;; size), and to fill the height the glyph is scaled past it via
          ;; ICON-SCALE (the oversized em is clipped to the image).
          (iw (cond ((not icon) 0)
-                   ((eq icon-width 'square) height)
+                   ((eq icon-width 'square) ch)
                    ((numberp icon-width) icon-width)
                    (t (+ (round (* isz 0.55)) (round (* fz 0.12))))))
-         (left-x0 (+ pad iw))
+         (left-x0 (+ x0 iw))
          (svg (svg-create width height))
          (svg-line--seg-acc nil))
-    (when background (svg-rectangle svg 0 0 width height :fill background))
+    ;; The background stops at the padding rather than filling the whole
+    ;; image: PAD-Y exists to put clear space between this bar and the one
+    ;; next to it, and a rect drawn over that space would just make the bar
+    ;; taller instead -- the bars would still butt together, only thicker.
+    (when background
+      (svg-rectangle svg margin mtop (max 1 (- width (* 2 margin))) bg-h
+                     :fill background))
     ;; full-height masthead icon on the left, drawn once for the whole image.
     ;; The glyph's ink sits in the left ~half of its em box, so to centre the
     ;; ink within the reserved cell we shift the draw origin left by ~a quarter
@@ -588,15 +620,15 @@ left-aligned content is inset past it.  Returns an svg object."
       ;; centre ~0.255 em right of the origin; offset by those to centre the ink
       ;; in the reserved cell (clamped to PAD so a tight cell stays flush-left).
       (let ((svg-line-glyph-scale 1.0)   ; size the glyph explicitly, not via the run scale
-            (ix (max pad (- (+ pad (/ iw 2)) (round (* isz 0.255))))))
+            (ix (max x0 (- (+ x0 (/ iw 2)) (round (* isz 0.255))))))
         (svg-line--add-text svg icon
                             :x ix
-                            :y (round (+ (/ height 2.0) (* isz 0.335)))
+                            :y (round (+ rows-y (/ ch 2.0) (* isz 0.335)))
                             :font font :font-size isz
                             :fill (svg-line--color (or icon-color foreground)))))
     (cl-loop for row in rows
              for i from 0
-             for top = (* lh i)
+             for top = (+ rows-y (* lh i))
              for y = (+ top fz)
              for l = (if (vectorp row) (aref row 0) (car row))
              for c = (if (vectorp row) (aref row 1) nil)
@@ -621,7 +653,7 @@ left-aligned content is inset past it.  Returns an svg object."
                    ((consp c)
                     (let* ((cc (svg-line--runs-rtrim (svg-line--runs-ltrim c)))
                            (cw (svg-line--runs-width cc char-advance fz)))
-                      (svg-line--draw-runs svg cc (max pad (/ (- width cw) 2))
+                      (svg-line--draw-runs svg cc (max x0 (/ (- width cw) 2))
                                            top fz lh font char-advance foreground
                                            hovered hover-color))))
                   ;; RIGHT: flush-right.  Trim trailing whitespace so the
@@ -633,7 +665,7 @@ left-aligned content is inset past it.  Returns an svg object."
                                         :font font :font-size fz :fill foreground))
                    ((consp r)
                     (let ((rr (svg-line--runs-rtrim r)))
-                      (svg-line--draw-runs svg rr (max pad (- rx (svg-line--runs-width rr char-advance fz)))
+                      (svg-line--draw-runs svg rr (max x0 (- rx (svg-line--runs-width rr char-advance fz)))
                                            top fz lh font char-advance foreground
                                            hovered hover-color))))))
     ;; Centred, row-spanning overlays drawn once over a row range, on top of
@@ -647,7 +679,7 @@ left-aligned content is inset past it.  Returns an svg object."
                (b (if (consp rng) (cdr rng) (1- (length rows))))
                (sh (* lh (1+ (- b a))))
                (cx (/ width 2))
-               (cy (round (+ (* lh a) (/ sh 2.0))))
+               (cy (round (+ rows-y (* lh a) (/ sh 2.0))))
                (r (max 3 (round (* (/ sh 2.0) 0.86)))))
           (pcase (car span)
             (:clock (svg-line--draw-clock svg cx cy r (or (nth 2 span) foreground)
@@ -911,29 +943,38 @@ empty STR.  For finer control (a custom action/help/id) build on
                                     :action handler))
                   text)))))))
 
-(defun svg-line--wrap-place (items width char-advance gap lh &optional center)
+(defun svg-line--wrap-place (items width char-advance gap lh
+                                   &optional center x0 x1 y0)
   "Return placements (X TOP CW ITEM) for ITEMS in a `wrap' layout.
 WIDTH bounds each row; CHAR-ADVANCE, GAP and LH set per-item width and row
-height.  When CENTER is non-nil and the items all fit on a single row (no
-wrapping), the row is centred horizontally within WIDTH.  Shared by drawing
-\(`svg-line-wrap-image') and click hit-testing (`svg-line--seg-at') so both
-agree on where each item sits."
-  (let ((x 0) (row 0) (out nil))
+height.  X0 and X1 bound the flow horizontally (items start at X0 and wrap
+at X1, both absolute so the caller can fold a margin and a padding into
+them); Y0 is the absolute top of the first row.  When CENTER is non-nil and
+the items all fit on a single row (no wrapping), that row is centred between
+X0 and X1, so an inset background stays symmetrical.
+Shared by drawing (`svg-line-wrap-image') and click hit-testing
+\(`svg-line--seg-at') so both agree on where each item sits: insetting HERE is
+what keeps the hover and click boxes under the tabs they moved with."
+  (let* ((x0 (or x0 0))
+         (y0 (or y0 0))
+         (right (max (1+ x0) (or x1 width)))
+         (x x0) (row 0) (out nil))
     (dolist (it items)
       (let* ((label (car it))
              (cw (* (length label) char-advance))
              (w  (+ cw (* gap char-advance))))
-        (when (and (> x 0) (> (+ x w) width))
-          (setq x 0 row (1+ row)))
-        (push (list x (* row lh) cw it) out)
+        (when (and (> x x0) (> (+ x w) right))
+          (setq x x0 row (1+ row)))
+        (push (list x (+ y0 (* row lh)) cw it) out)
         (setq x (+ x w))))
     (setq out (nreverse out))
     ;; centre a single (un-wrapped) row: shift every placement right by half
     ;; the slack, so few tabs sit centred rather than flush-left.
     (when (and center out
-               (= 0 (apply #'max 0 (mapcar (lambda (p) (nth 1 p)) out))))
-      (let* ((rowwidth (apply #'max 0 (mapcar (lambda (p) (+ (nth 0 p) (nth 2 p))) out)))
-             (offset (/ (- width rowwidth) 2)))
+               (= y0 (apply #'max 0 (mapcar (lambda (p) (nth 1 p)) out))))
+      (let* ((rowwidth (- (apply #'max 0 (mapcar (lambda (p) (+ (nth 0 p) (nth 2 p))) out))
+                          x0))
+             (offset (- (/ (- (+ x0 right) rowwidth) 2) x0)))
         (when (> offset 0)
           (setq out (mapcar (lambda (p) (cons (+ (nth 0 p) offset) (cdr p))) out)))))
     out))
@@ -963,6 +1004,10 @@ property so `svg-line--note-help' can track which item the mouse is over."
                                      (font-size svg-line-font-size)
                                      (line-pad svg-line-line-pad)
                                      (char-advance svg-line-char-advance)
+                                     (pad 0)
+                                     (pad-y 0)
+                                     (margin 0)
+                                     (margin-y 0)
                                      (gap 3)
                                      (foreground "#000000")
                                      (background nil)
@@ -976,7 +1021,17 @@ property so `svg-line--note-help' can track which item the mouse is over."
                                      (center nil))
   "Build a `wrap'-layout SVG from ITEMS, a list of (LABEL . STATE).
 Items flow left-to-right and wrap onto new rows at WIDTH.  GAP is the
-inter-item gap in character widths.  FONT, FONT-SIZE, LINE-PAD,
+inter-item gap in character widths.
+
+Spacing comes in two kinds, as in CSS.  MARGIN and MARGIN-Y sit OUTSIDE the
+background: clear space that separates this bar from whatever is next to it.
+PAD and PAD-Y sit INSIDE it, between the background edge and the pills --
+which is what makes the pills read as floating in a container, their boxes
+being drawn at the full row height so that without it a pill fills the
+background exactly.  MARGIN narrows the painted background itself, so a bar
+can be visibly narrower than the window it sits in.  Each vertical one is a
+number, or a cons (TOP . BOTTOM) for an uneven gap.
+FONT, FONT-SIZE, LINE-PAD,
 CHAR-ADVANCE, FOREGROUND and BACKGROUND set the text family, size,
 per-row padding, character advance and base colours.  When CENTER is
 non-nil and the items fit on a single row, that row is centred within
@@ -1006,11 +1061,32 @@ pointer)."
          (fz font-size)
          (char-advance (svg-line--char-advance char-advance fz))
          (lh (+ fz line-pad))
-         (placements (svg-line--wrap-place items width char-advance gap lh center))
-         (height (max 1 (apply #'max lh (mapcar (lambda (p) (+ (nth 1 p) lh)) placements))))
+         (pad-y (svg-line--pad-y pad-y))
+         (pad-top (car pad-y))
+         (pad-bot (cdr pad-y))
+         (margin-y (svg-line--pad-y margin-y))
+         (mtop (car margin-y))
+         (mbot (cdr margin-y))
+         (rows-y (+ mtop pad-top))
+         (x0 (+ margin pad))
+         (x1 (max (1+ x0) (- width margin pad)))
+         (placements (svg-line--wrap-place items width char-advance gap lh
+                                           center x0 x1 rows-y))
+         ;; The placer has already put the first row at ROWS-Y, so the tallest
+         ;; placement accounts for the top margin and padding both.
+         (rows-bottom (apply #'max (+ rows-y lh)
+                             (mapcar (lambda (p) (+ (nth 1 p) lh)) placements)))
+         (bg-h (+ pad-top (- rows-bottom rows-y) pad-bot))
+         (height (max 1 (+ mtop bg-h mbot)))
          (svg (svg-create width height))
          (map nil))
-    (when background (svg-rectangle svg 0 0 width height :fill background))
+    ;; As in the `lines' layout: MARGIN/MARGIN-Y sit OUTSIDE this rect and are
+    ;; never painted (space between bars), PAD/PAD-Y inside it (space around
+    ;; the pills, which is what makes them read as floating in a container
+    ;; rather than filling one).
+    (when background
+      (svg-rectangle svg margin mtop (max 1 (- width (* 2 margin))) bg-h
+                     :fill background))
     (dolist (p placements)
       (cl-destructuring-bind (px top cw it) p
         (let* ((label (car it))
@@ -1099,13 +1175,29 @@ scaling its `:font-size'/`:char-advance' instead, not the image."
   (let ((v (plist-member spec key)))
     (if v (svg-line--val (cadr v)) default)))
 
+(defun svg-line--window-width ()
+  "Pixel width available to a window-scoped bar.
+
+NOT `window-pixel-width': that one \"includes the fringes and margins of
+WINDOW as well as any vertical dividers or scroll bars belonging to WINDOW\",
+and a bar is not drawn across those.  Using it directly makes every image
+too wide by the divider -- harmless while dividers are a hairline, but with a
+wide one the right-aligned content is pushed clean off the visible edge and
+clipped, in every window except the last of its row (which has no right
+divider and so renders correctly, making it look like a split bug)."
+  (max 1 (- (window-pixel-width)
+            (or (ignore-errors (window-right-divider-width)) 0)
+            (or (and (fboundp 'window-scroll-bar-width)
+                     (ignore-errors (window-scroll-bar-width)))
+                0))))
+
 (defun svg-line--width (spec)
   "Resolve the pixel width for SPEC."
   (let ((w (or (plist-get spec :width)
                (if (eq (plist-get spec :target) 'tab-bar) 'frame 'window))))
     (max 1 (pcase w
              ('frame (frame-inner-width))
-             ('window (window-pixel-width))
+             ('window (svg-line--window-width))
              ((pred functionp) (funcall w))
              ((pred integerp) w)
              (_ 100)))))
@@ -1159,8 +1251,22 @@ Returns 1.0 when scaling is disabled or unavailable."
         1.0))))
 
 (defun svg-line--scaled (size)
-  "Scale pixel SIZE by the current text-scale factor (integer result)."
-  (round (* size (svg-line--text-scale))))
+  "Scale pixel SIZE by the current text-scale factor (integer result).
+SIZE may be a cons (A . B) -- both halves are scaled -- so the asymmetric
+form of `:pad-y' survives text scaling like every other measurement."
+  (if (consp size)
+      (cons (round (* (car size) (svg-line--text-scale)))
+            (round (* (cdr size) (svg-line--text-scale))))
+    (round (* size (svg-line--text-scale)))))
+
+(defun svg-line--pad-y (pad-y)
+  "Normalise PAD-Y to (TOP . BOTTOM).
+A number pads both ends equally; a cons (TOP . BOTTOM) pads them
+separately, which is how a bar gets a gap on the side facing its neighbour
+without an equal one on the side facing away."
+  (cond ((consp pad-y) (cons (or (car pad-y) 0) (or (cdr pad-y) 0)))
+        ((numberp pad-y) (cons pad-y pad-y))
+        (t (cons 0 0))))
 
 (defun svg-line--row-segs (row)
   "Return (LEFT-SEGS CENTER-SEGS RIGHT-SEGS) for a `lines' content ROW.
@@ -1201,6 +1307,9 @@ gets a hover box.  Sizes scale with the default font (see
      :font-size (svg-line--scaled (svg-line--opt spec :font-size svg-line-font-size))
      :line-pad (svg-line--scaled (svg-line--opt spec :line-pad svg-line-line-pad))
      :pad (svg-line--scaled (svg-line--opt spec :pad 0))
+     :pad-y (svg-line--scaled (svg-line--opt spec :pad-y 0))
+     :margin (svg-line--scaled (svg-line--opt spec :margin 0))
+     :margin-y (svg-line--scaled (svg-line--opt spec :margin-y 0))
      :right-margin (svg-line--scaled (svg-line--opt spec :right-margin 0))
      ;; nil lets `svg-line-image' derive the advance from the (scaled) font
      ;; size; an explicit value is scaled to match.
@@ -1244,6 +1353,10 @@ mirroring the `lines' layout."
                          :char-advance (let ((e (or (svg-line--opt spec :char-advance nil)
                                                     svg-line-char-advance)))
                                          (and e (* e sc)))
+                         :pad (svg-line--scaled (svg-line--opt spec :pad 0))
+                         :pad-y (svg-line--scaled (svg-line--opt spec :pad-y 0))
+                         :margin (svg-line--scaled (svg-line--opt spec :margin 0))
+                         :margin-y (svg-line--scaled (svg-line--opt spec :margin-y 0))
                          :gap (svg-line--opt spec :gap 3)
                          :foreground (funcall pick :foreground :inactive-foreground "#000000")
                          :background (funcall pick :background :inactive-background)
@@ -1559,7 +1672,18 @@ Recognised SPEC keys:
            while a minibuffer session previews other buffers, which
            would otherwise flip the segments (and repaint the bar with
            alternating images) on every preview.
-  :font :font-size :line-pad :pad :right-margin :char-advance
+  :font :font-size :line-pad :char-advance
+  :pad :pad-y :margin :margin-y :right-margin
+           Spacing, in the CSS sense.  :margin/:margin-y are OUTSIDE the
+           background -- clear space separating this bar from its neighbour,
+           and :margin also narrows the painted background itself.
+           :pad/:pad-y (and :right-margin, whose name predates this split)
+           are INSIDE it, between the background edge and the content.  With
+           no :background the two are indistinguishable; they diverge the
+           moment a bar is painted.  Each vertical one takes a number or a
+           cons (TOP . BOTTOM).  :line-pad is neither: it grows the space
+           below EACH ROW, so it separates rows and pads the bottom but never
+           the top.  Both layouts.
   :foreground :background
   :active   a predicate; when present and false, inactive variants apply
   :inactive-foreground :inactive-background
