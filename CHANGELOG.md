@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/chiply/svg-line/compare/v0.1.7...v0.1.8) (2026-09-07)
+
+
+### Features
+
+* measure fonts instead of assuming them ([#16](https://github.com/chiply/svg-line/issues/16)) ([e35787a](https://github.com/chiply/svg-line/commit/e35787aeef6a1b06118ce7a494061ad7426117ed))
+
 ## [0.1.7](https://github.com/chiply/svg-line/compare/v0.1.6...v0.1.7) (2026-09-04)
 
 
