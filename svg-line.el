@@ -516,12 +516,18 @@ numbers were taken from -- gets exactly 1.0 and does not move."
     (if (> h 0.01) (/ (nth 1 svg-line-icon-ink-fallback) h) 1.0)))
 
 (defun svg-line--xml-escape (text)
-  "Escape the XML metacharacters &, < and > in TEXT for SVG text content.
+  "Escape the XML metacharacters &, <, > and \" in TEXT for SVG.
 A private escaper so the package does not depend on svg.el internals
-\(e.g. `svg--encode-text', whose stability is not guaranteed)."
+\(e.g. `svg--encode-text', whose stability is not guaranteed).
+
+The double quote is escaped as well because the font probes format their
+values into ATTRIBUTES, which are quote-delimited -- a family name carrying
+a quote would otherwise close the attribute early and the rest of the name
+would be parsed as markup.  It is valid in text content too, and renders
+identically there, so one escaper serves both."
   (replace-regexp-in-string
-   "[&<>]"
-   (lambda (m) (pcase m ("&" "&amp;") ("<" "&lt;") (">" "&gt;")))
+   "[&<>\"]"
+   (lambda (m) (pcase m ("&" "&amp;") ("<" "&lt;") (">" "&gt;") ("\"" "&quot;")))
    text t t))
 
 (defun svg-line--add-text (svg str &rest props)

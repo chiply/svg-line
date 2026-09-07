@@ -772,3 +772,16 @@ with the modified accent so the unsaved state stays visible."
         (should (null (dom-attr n 'dx)))
         (should (null (dom-attr n 'letter-spacing))))
       (should (null (dom-attr (car (dom-by-tag svg 'text)) 'letter-spacing))))))
+
+(ert-deftest svg-line/xml-escape-covers-attribute-context ()
+  "The escaper is safe for attribute values, not just text content.
+The font probes format a family name into a quote-delimited attribute, so a
+name carrying a quote would close it early and the rest would parse as
+markup."
+  (should (equal "Plain" (svg-line--xml-escape "Plain")))
+  (should (equal "A&amp;B" (svg-line--xml-escape "A&B")))
+  (should (equal "&lt;i&gt;" (svg-line--xml-escape "<i>")))
+  (should (equal "Odd&quot;Name" (svg-line--xml-escape "Odd\"Name")))
+  ;; nothing of the injected markup survives into the probe
+  (let ((probe (svg-line--xml-escape "X\" onload=\"evil()")))
+    (should-not (string-match-p "\"" probe))))
