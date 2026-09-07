@@ -125,13 +125,26 @@ enlarges just those glyphs (via a larger `<tspan>'), so icons read at a
 comparable weight to the text.  1.0 disables the effect."
   :type 'number)
 
-(defun svg-line--char-advance (explicit font-size)
+(defun svg-line--char-advance (explicit font-size &optional ratio)
   "Resolve the per-character advance to use.
 EXPLICIT -- a spec's `:char-advance' or `svg-line-char-advance' -- wins when
-non-nil; otherwise derive it from FONT-SIZE via `svg-line-char-advance-ratio'."
+non-nil; otherwise derive it from FONT-SIZE via RATIO, defaulting to
+`svg-line-char-advance-ratio'.
+
+Prefer the RATIO form when a line names its own `:font': a ratio is a
+property of the FAMILY and survives text scaling, because it is applied to
+whatever font size the line ends up drawn at.  A pinned `:char-advance' is
+a property of one family at one size, so it has to be re-scaled alongside
+the font, and drifts as the rounding of the two diverges."
   (if explicit
       explicit
-    (max 1 (round (* font-size svg-line-char-advance-ratio)))))
+    ;; Deliberately NOT rounded.  A real font's advance is rarely a whole
+    ;; number of pixels (Terminess is 0.5 em -- 7.5px at font-size 15), and
+    ;; rounding it is a per-character error that accumulates: half a pixel
+    ;; over a forty-character row is twenty pixels of drift by the right
+    ;; margin.  Positions are rounded where they are EMITTED instead, so the
+    ;; error stays sub-pixel however long the row.
+    (max 1 (* font-size (or ratio svg-line-char-advance-ratio)))))
 
 (defun svg-line--glyph-char-p (ch)
   "Non-nil if CH is in a Nerd-Font / icon Private-Use code range."
@@ -152,13 +165,369 @@ non-nil; otherwise derive it from FONT-SIZE via `svg-line-char-advance-ratio'."
         (push (cons cur (substring str start n)) runs)))
     (nreverse runs)))
 
+(defun svg-line--glyph-advance (char-advance font-size)
+  "Advance of ONE icon glyph, given the text CHAR-ADVANCE at FONT-SIZE.
+Icon glyphs are drawn in an enlarged tspan (`svg-line-glyph-scale'), so they
+advance proportionally more than a text character does.  `svg-line--add-text'
+rounds that tspan's size to a whole number, so derive from the ROUNDED size --
+otherwise the width reserved here and the width drawn there disagree."
+  (if (and (> svg-line-glyph-scale 1.0) (> font-size 0))
+      (* char-advance (/ (float (round (* font-size svg-line-glyph-scale)))
+                         font-size))
+    char-advance))
+
+(defun svg-line--string-width (str char-advance font-size &optional font)
+  "Advance width in pixels of STR at CHAR-ADVANCE and FONT-SIZE in FONT.
+
+Text advances by CHAR-ADVANCE per character, icon glyphs by
+`svg-line--glyph-advance' -- they are drawn larger, so they take more room.
+Counting both at one flat advance is what let an icon overrun its cell: the
+glyph is drawn at `svg-line-glyph-scale' but only 1x was reserved for it, so
+every icon in a row pushed the content after it that much further right than
+the layout believed.
+
+What a corrected font's advance is inflated BY is trailing whitespace -- the
+renderer draws the outline in the right place and then moves the pen too far
+-- so the reserved width is the true advance and nothing needs adding for
+it.  FONT is taken for symmetry with the drawing side and to keep the two
+descriptions of a string's width in one place."
+  (ignore font)
+  (if (<= svg-line-glyph-scale 1.0)
+      (* (length str) char-advance)
+    (let ((ga (svg-line--glyph-advance char-advance font-size))
+          (w 0))
+      (dolist (run (svg-line--split-glyph-runs str) w)
+        (setq w (+ w (* (length (cdr run)) (if (car run) ga char-advance))))))))
+
+(defcustom svg-line-measure-fonts t
+  "Whether to measure a font's real ink by rendering it.
+
+The masthead icon is placed from the ink box of the glyph it draws -- how
+much of the em that glyph actually paints, and where.  Those numbers differ
+per family (Terminess inks half its em, Monaspace nearly two thirds), so
+measuring is what lets one set of geometry serve any font.
+
+nil falls back to fixed constants describing a Terminess-like font, which is
+what this package assumed before it could measure.  Set it to nil if the
+probe renders are unwelcome; they are cached per font and glyph, and only
+happen on a graphical display."
+  :type 'boolean)
+
+(defconst svg-line--ink-probe-size 120
+  "Font size, in px, at which glyph ink is probed.
+Big enough that rounding the render to whole pixels is noise, small enough
+that the throwaway raster is trivial.")
+
+(defconst svg-line-icon-ink-fallback '(0.5 0.45 0.0 0.5583)
+  "Icon ink box assumed when a font cannot be measured.
+\(WIDTH HEIGHT LEFT TOP), each a fraction of the font size: the ink's size,
+its offset from the text origin, and its top above the baseline.  These are
+Terminess's numbers -- the font this package's masthead geometry grew up
+around -- and were hardcoded until it learned to measure.")
+
+(defconst svg-line-icon-ink-probe (string #xF0614)
+  "Glyph whose ink calibrates masthead SIZING for a family.
+One glyph per font, not per icon: `:icon-scale' is meant to hold its meaning
+while the drawn glyph changes, so the normalisation has to come from the
+FAMILY rather than from whichever icon is up.  A Nerd-Font Material Design
+codepoint, present in every patched family this draws with.")
+
+(defvar svg-line--ink-cache (make-hash-table :test 'equal)
+  "Cache of (GLYPH . FONT) -> measured ink box.")
+
+(defvar svg-line--advance-cache (make-hash-table :test 'equal)
+  "Cache of FONT -> measured per-character advance, as a fraction of the em.")
+
+(defvar svg-line--native-cache (make-hash-table :test 'equal)
+  "Cache of FONT -> advance the font itself declares, as a fraction of the em.")
+
+;;;###autoload
+(defun svg-line-forget-font-metrics ()
+  "Drop the cached font measurements.
+Run after installing, removing or replacing a font."
+  (interactive)
+  (clrhash svg-line--ink-cache)
+  (clrhash svg-line--advance-cache)
+  (clrhash svg-line--native-cache))
+
+(defun svg-line--intrinsic-size (svg)
+  "Rendered size of the SVG string SVG as (WIDTH . HEIGHT), or nil.
+
+An SVG carrying no width/height renders at its content's bounding box, so
+the image this creates is exactly as big as the ink inside it.  That is what
+makes a renderer metric -- which librsvg never reports -- readable from
+Lisp, and it is the same renderer that will draw the line, so the answer is
+about the right font rather than about Emacs's idea of it."
+  (and svg-line-measure-fonts
+       (seq-some #'display-graphic-p (frame-list))
+       (ignore-errors
+         (let ((image-scaling-factor 1.0))
+           (image-size (create-image svg 'svg t) t)))))
+
+(defun svg-line--probe-extent (font glyph size body)
+  "Extent from the SVG origin of GLYPH in FONT at SIZE, wrapped in BODY.
+BODY is a format string taking the `<text>' element."
+  (svg-line--intrinsic-size
+   (format "<svg xmlns=\"http://www.w3.org/2000/svg\">%s</svg>"
+           (format body
+                   (format "<text x=\"0\" y=\"0\" font-family=\"%s\" font-size=\"%d\">%s</text>"
+                           (svg-line--xml-escape font) size
+                           (svg-line--xml-escape glyph))))))
+
+(defun svg-line-glyph-ink (glyph font)
+  "Ink box of GLYPH drawn in FONT, as fractions of the font size.
+
+Returns (WIDTH HEIGHT LEFT TOP): the painted box's size, how far right of
+the text origin it starts, and how far above the baseline it reaches.  Falls
+back to `svg-line-icon-ink-fallback' when measuring is off or impossible.
+
+Two renders, because of how the measurement works.  An SVG carrying no
+width/height sizes itself to its content -- but Emacs reports that size as
+the extent from the SVG ORIGIN to the content's far corner, not as the
+content's own bounding box.  One render therefore pins only the ink's right
+and bottom edges.  The second draws the glyph rotated a half turn about a
+known point, which swaps those edges for the other two, and the four
+numbers together give the box.
+
+The alternative -- a probe whose baseline sits at y=0 -- does not work: a
+glyph's ink is entirely ABOVE its baseline, so the content lies at negative
+y and the renderer answers with a default size instead of a measurement."
+  (or (svg-line--measure-ink glyph font) svg-line-icon-ink-fallback))
+
+(defun svg-line--measure-ink (glyph font)
+  "Measure GLYPH's ink box in FONT, or nil when it cannot be measured.
+The measuring half of `svg-line-glyph-ink', kept separate because some
+callers need to know that no measurement happened rather than receive a
+stand-in: the icon fallback describes an ICON, and is the wrong answer for,
+say, a cap height."
+  (let ((key (cons glyph font)))
+    (or (gethash key svg-line--ink-cache)
+        (let* ((sz svg-line--ink-probe-size)
+               (k (* 2 sz))             ; far enough that the turned glyph is
+                                        ; wholly in positive coordinates
+               (plain (svg-line--probe-extent
+                       font glyph sz (format "<g transform=\"translate(0,%d)\">%%s</g>" sz)))
+               (turned (and plain
+                            (svg-line--probe-extent
+                             font glyph sz
+                             (format "<g transform=\"translate(%d,%d) rotate(180)\">%%s</g>" k k)))))
+          (when (and plain turned (> (car plain) 0) (> (cdr plain) 0)
+                     (> (car turned) 0) (> (cdr turned) 0))
+            (let* ((left (- k (car turned)))              ; ink's left bearing
+                   (top  (- (cdr turned) k))              ; ink's top over the baseline
+                   (w    (- (car plain) left))            ; right edge back to left
+                   (h    (+ (- (cdr plain) sz) top)))     ; bottom under baseline, plus top
+              (when (and (> w 0) (> h 0))
+                (puthash key (list (/ w (float sz)) (/ h (float sz))
+                                   (/ left (float sz)) (/ top (float sz)))
+                         svg-line--ink-cache))))))))
+
+(defcustom svg-line-correct-tracking t
+  "Whether to correct a renderer that advances a font wrongly.
+
+librsvg reads some fonts' advance widths incorrectly while drawing their
+outlines correctly.  Monaspace is one: its `hmtx' says a character is 0.62
+em wide and its cap height 0.73 em, which is what Emacs renders and what the
+font's own tables say -- but librsvg advances 0.7775 em, a quarter too far,
+while sizing the glyphs right.  The text then reads correctly shaped but
+conspicuously loose, and visibly wider than the same font in a buffer.
+
+With this on, the gap is closed with negative `letter-spacing', which moves
+the glyphs back onto the font's true pitch WITHOUT distorting them -- the
+outlines were never wrong, only the spacing between them.  Layout then uses
+the true advance, so a line takes the width the font actually asks for.
+
+nil draws whatever the renderer does, which is the honest thing if you
+suspect the correction of doing harm."
+  :type 'boolean)
+
+(defun svg-line-font-advance-native (font)
+  "Advance of one character in FONT as the FONT ITSELF declares it, or nil.
+
+Read from the font through Emacs, which -- unlike librsvg for some
+families -- agrees with the `hmtx' table.  Measured at a large size so that
+rounding the advance to whole pixels is noise."
+  (or (gethash font svg-line--native-cache)
+      (and (seq-some #'display-graphic-p (frame-list))
+           (ignore-errors
+             (let* ((size 400)
+                    (entity (find-font (font-spec :family font :size size)))
+                    (obj (and entity (open-font entity size)))
+                    (glyph (and obj (aref (font-get-glyphs obj 0 1 "M") 0)))
+                    (adv (and glyph (aref glyph 4))))
+               (when (and adv (> adv 0))
+                 (puthash font (/ adv (float size)) svg-line--native-cache)))))))
+
+(defun svg-line-font-advance (font)
+  "Advance of one character in FONT, as a fraction of the font size, or nil.
+The advance the text will EFFECTIVELY have: the font's own when the renderer
+is being corrected (`svg-line-correct-tracking'), otherwise the renderer's."
+  (or (and svg-line-correct-tracking (svg-line-font-advance-native font))
+      (svg-line-font-advance-rendered font)))
+
+(defun svg-line-tracking-ratio (font)
+  "Letter-spacing FONT needs to draw at its true pitch.
+As a fraction of the font size; 0 when no correction applies."
+  (or (and svg-line-correct-tracking
+           (let ((native (svg-line-font-advance-native font))
+                 (drawn (svg-line-font-advance-rendered font)))
+             (and native drawn (- native drawn))))
+      0))
+
+(defun svg-line-font-advance-rendered (font)
+  "Advance of one character in FONT, as a fraction of the font size, or nil.
+
+Measured through librsvg, so it is the width the text will actually be drawn
+at rather than the width Emacs would draw it at -- the two disagree, and for
+some families badly (a font whose CFF `FontMatrix' contradicts its `head'
+units-per-em is read differently by FreeType and by the platform's own
+shaper).  Two lengths are rendered and subtracted, which cancels both the
+glyph's side bearings and the origin offset in the reported extent.
+
+Used to lay out a run that names its own `:font'.  nil when measuring is off
+or unavailable, in which case the caller keeps the line's own advance."
+  (or (gethash font svg-line--advance-cache)
+      (let* ((sz svg-line--ink-probe-size)
+             (body (format "<g transform=\"translate(0,%d)\">%%s</g>" sz))
+             (short (svg-line--probe-extent font (make-string 4 ?M) sz body))
+             (long  (and short (svg-line--probe-extent font (make-string 24 ?M) sz body)))
+             (ratio (and long (/ (- (car long) (car short)) 20.0 sz))))
+        (when (and ratio (> ratio 0))
+          (puthash font ratio svg-line--advance-cache)))))
+
+(defcustom svg-line-normalise-font-size 'cap
+  "How `:font-size' is made to mean the same size in every family.
+
+A font size names an em, and families fill their em to very different
+degrees: at the same nominal size Monaspace's capitals stand 18% taller than
+Terminess's, and each character takes 24% more width.  So a bar retuned from
+one family to another comes out looking nothing like it did.
+
+There are two defensible things to hold constant, and they disagree:
+
+  `cap' (or t)  match the height of the CAPITALS.  Preserves legibility;
+                a wide family then takes more room than it used to.
+  `advance'     match the WIDTH of a character.  Preserves the footprint --
+                what fits on the line -- at the cost of smaller type.
+
+A float in [0, 1] blends the two, 0 being `cap' and 1 being `advance'.  nil
+takes the size literally, which is what SVG means by it and what this
+package did before it could measure.
+
+`cap' is the default because the two now nearly agree, and they do so only
+because of `svg-line-correct-tracking'.  Uncorrected, librsvg walks
+Monaspace a quarter wider than the font asks, the bases disagree by 35%, and
+no single choice looks right -- which is what the blend was for.  With the
+renderer corrected the width cost of matching cap heights is about 7%, and
+matching the thing a reader actually judges size by wins."
+  :type '(choice (const :tag "Match cap height" cap)
+                 (const :tag "Match advance" advance)
+                 (float :tag "Blend (0 = cap, 1 = advance)")
+                 (const :tag "Literal" nil)))
+
+(defconst svg-line-cap-height-reference 0.6167
+  "Cap height, as a fraction of the em, that `:font-size' is normalised to.
+Terminess's, measured -- so a Terminess line is scaled by exactly 1.0 and
+does not move.  Raise it to make every family read larger.")
+
+(defconst svg-line-advance-reference 0.5
+  "Character advance, as a fraction of the em, that `:font-size' is normalised to.
+Terminess's, measured, for the same reason as `svg-line-cap-height-reference':
+together they make the reference family the fixed point, so a line already
+tuned in it is not disturbed by normalising against it.")
+
+(defun svg-line-cap-height (font)
+  "Ink height of a capital in FONT, as a fraction of the font size, or nil."
+  (nth 1 (svg-line--measure-ink "M" font)))
+
+(defun svg-line--font-size-factor (font)
+  "Scale making FONT draw at the reference size.
+Per `svg-line-normalise-font-size': matching cap height, matching advance,
+or a blend.  1.0 when normalising is off, or when the measurement the chosen
+basis needs is unavailable -- an unmeasurable font is left alone rather than
+guessed at."
+  (let* ((mode svg-line-normalise-font-size)
+         (weight (cond ((null mode) nil)
+                       ((eq mode 'advance) 1.0)
+                       ((memq mode '(cap t)) 0.0)
+                       ((numberp mode) (max 0.0 (min 1.0 (float mode))))
+                       (t 0.0))))
+    (if (null weight)
+        1.0
+      (let* ((cap (and (< weight 1.0) (svg-line-cap-height font)))
+             (adv (and (> weight 0.0) (svg-line-font-advance font)))
+             (fc (and cap (> cap 0.01) (/ svg-line-cap-height-reference cap)))
+             (fa (and adv (> adv 0.01) (/ svg-line-advance-reference adv))))
+        (cond ((and fc fa) (+ (* (- 1.0 weight) fc) (* weight fa)))
+              ;; one basis missing: fall back to whichever measured, rather
+              ;; than to 1.0, which would leave the size unnormalised
+              (fc fc)
+              (fa fa)
+              (t 1.0))))))
+
+(defun svg-line--font-size-for (font nominal)
+  "NOMINAL font size adjusted so FONT draws at the reference cap height."
+  (max 1 (round (* nominal (svg-line--font-size-factor font)))))
+
+(defun svg-line--relative-size (base other fz)
+  "FZ rescaled so OTHER draws at the same cap height BASE does at FZ.
+Keeps a run that names its own family optically level with the line around
+it, however differently that family fills its em."
+  (let ((bc (svg-line-cap-height base))
+        (oc (svg-line-cap-height other)))
+    (if (and bc oc (> oc 0.01)) (max 1 (round (* fz (/ bc oc)))) fz)))
+
+(defun svg-line--run-face (run font fz char-advance)
+  "Return (FAMILY SIZE ADVANCE) to draw RUN with.
+The line's own FONT, FZ and CHAR-ADVANCE unless the run names a `:font',
+in which case that family, sized to match optically and advanced at its own
+rate."
+  (let ((rf (and (eq (car run) :seg) (plist-get (nth 2 run) :font))))
+    (if (or (null rf) (equal rf font))
+        (list font fz char-advance)
+      (let* ((sfz (svg-line--relative-size font rf fz))
+             (adv (svg-line-font-advance rf)))
+        (list rf sfz (if adv (* sfz adv) char-advance))))))
+
+(defun svg-line--run-advance (run font char-advance fz)
+  "Per-character advance for RUN on a line of FONT at FZ, else CHAR-ADVANCE.
+
+A run that names its own `:font' is drawn in that family and so advances at
+that family's rate, not the line's.  Measured when it can be
+\(`svg-line-font-advance'); otherwise the line's CHAR-ADVANCE stands in,
+which is exactly right for the common case of mixing metrically compatible
+cuts of one superfamily and merely approximate otherwise."
+  (nth 2 (svg-line--run-face run font fz char-advance)))
+
+(defun svg-line--icon-size-factor (font)
+  "Correction making `:icon-scale' mean the same in FONT as in the reference.
+
+`:icon-scale' has always meant \"how much of the bar height the icon's INK
+should fill\" -- that is why values above 1 are normal, the em being mostly
+empty around a Nerd glyph.  It could only mean that for one font, though,
+while the ink fraction was a constant: Terminess inks 0.46 of its em and
+Monaspace 0.57, so the same scale draws a masthead a fifth larger in the
+latter, overflowing its cell and painting over the row icons beside it.
+
+Dividing the reference ink by the measured one takes that out.  A font
+whose ink matches `svg-line-icon-ink-fallback' -- Terminess, which these
+numbers were taken from -- gets exactly 1.0 and does not move."
+  (let ((h (nth 1 (svg-line-glyph-ink svg-line-icon-ink-probe font))))
+    (if (> h 0.01) (/ (nth 1 svg-line-icon-ink-fallback) h) 1.0)))
+
 (defun svg-line--xml-escape (text)
-  "Escape the XML metacharacters &, < and > in TEXT for SVG text content.
+  "Escape the XML metacharacters &, <, > and \" in TEXT for SVG.
 A private escaper so the package does not depend on svg.el internals
-\(e.g. `svg--encode-text', whose stability is not guaranteed)."
+\(e.g. `svg--encode-text', whose stability is not guaranteed).
+
+The double quote is escaped as well because the font probes format their
+values into ATTRIBUTES, which are quote-delimited -- a family name carrying
+a quote would otherwise close the attribute early and the rest of the name
+would be parsed as markup.  It is valid in text content too, and renders
+identically there, so one escaper serves both."
   (replace-regexp-in-string
-   "[&<>]"
-   (lambda (m) (pcase m ("&" "&amp;") ("<" "&lt;") (">" "&gt;")))
+   "[&<>\"]"
+   (lambda (m) (pcase m ("&" "&amp;") ("<" "&lt;") (">" "&gt;") ("\"" "&quot;")))
    text t t))
 
 (defun svg-line--add-text (svg str &rest props)
@@ -171,6 +540,10 @@ so no manual positioning is needed."
          (scale svg-line-glyph-scale)
          (big (round (* fz scale)))
          (shift (round (/ (* fz (- scale 1.0)) 2.0)))
+         ;; negative when the renderer advances this family too far; it pulls
+         ;; the glyphs back onto the font's own pitch without touching their
+         ;; shapes (see `svg-line-correct-tracking')
+         (tr (svg-line-tracking-ratio (plist-get props :font)))
          (attrs (list (cons 'x (plist-get props :x))
                       (cons 'y (plist-get props :y))
                       (cons 'font-family (plist-get props :font))
@@ -180,17 +553,31 @@ so no manual positioning is needed."
                       ;; whitespace at a tspan boundary, swallowing the space
                       ;; after an enlarged glyph
                       (cons 'xml:space "preserve"))))
+    (unless (zerop tr) (push (cons 'letter-spacing (* tr fz)) attrs))
     (when (plist-get props :weight) (push (cons 'font-weight (plist-get props :weight)) attrs))
     (when (plist-get props :anchor) (push (cons 'text-anchor (plist-get props :anchor)) attrs))
-    (let ((node (dom-node 'text (nreverse attrs))) (cur-dy 0))
+    (let ((node (dom-node 'text (nreverse attrs))) (cur-dy 0) (prev-size nil))
       (dolist (run (svg-line--split-glyph-runs str))
         (let* ((glyphp (and (car run) (> scale 1.0)))
                (target (if glyphp shift 0))
-               (dy (- target cur-dy)))
-          (setq cur-dy target)
+               (dy (- target cur-dy))
+               (size (if glyphp big fz))
+               ;; letter-spacing reaches only the gaps BETWEEN characters, so
+               ;; a tspan's own trailing gap keeps the renderer's error and
+               ;; the next tspan starts that much too far right.  Pull it
+               ;; back, or an icon would space the text after it apart -- and
+               ;; a run of one character, which has no gaps at all, could not
+               ;; be corrected in any other way.
+               (dx (and prev-size (not (zerop tr)) (* tr prev-size))))
+          (setq cur-dy target prev-size size)
           (dom-append-child
            node (dom-node 'tspan
                           (append (when glyphp (list (cons 'font-size big)))
+                                  ;; the enlarged glyph needs the correction
+                                  ;; scaled to the size it is drawn at
+                                  (when (and glyphp (not (zerop tr)))
+                                    (list (cons 'letter-spacing (* tr big))))
+                                  (when dx (list (cons 'dx dx)))
                                   (unless (zerop dy) (list (cons 'dy dy))))
                           ;; encode <>& like `svg-text' does (svg-print emits
                           ;; text content verbatim, so escape it ourselves)
@@ -344,21 +731,26 @@ flush at the right edge instead of leaving a gap from empty trailing segments."
     (setq runs (cons (list :text (string-trim-right (nth 1 (car runs)))) (cdr runs))))
   (nreverse runs))
 
-(defun svg-line--run-width (run char-advance fz)
-  "Advance width in pixels of a single RUN.
-Text advances by CHAR-ADVANCE per character; bars and pies derive their
-size from the font size FZ."
+(defun svg-line--run-width (run font char-advance fz)
+  "Advance width in pixels of a single RUN on a line whose family is FONT.
+Text advances by CHAR-ADVANCE per character -- icon glyphs by more, see
+`svg-line--string-width', and a run naming its own `:font' by that family's
+rate, see `svg-line--run-advance' -- and bars and pies derive their size from
+the font size FZ."
   (pcase (car run)
-    (:text (* (length (nth 1 run)) char-advance))
-    (:seg  (* (length (nth 1 run)) char-advance))
+    (:text (svg-line--string-width (nth 1 run) char-advance fz font))
+    (:seg  (cl-destructuring-bind (sfont sfz sadv)
+               (svg-line--run-face run font fz char-advance)
+             (svg-line--string-width (nth 1 run) sadv sfz sfont)))
     (:pie  (+ (round (* fz 0.76)) (round (* 0.3 fz))))   ; diameter + gap
     (:bar  (+ (nth 2 run) (round (* 0.3 fz))))
     (_ 0)))
 
-(defun svg-line--runs-width (runs char-advance fz)
+(defun svg-line--runs-width (runs font char-advance fz)
   "Total advance width in pixels of RUNS (for right alignment).
-CHAR-ADVANCE and font size FZ are passed through to `svg-line--run-width'."
-  (apply #'+ (mapcar (lambda (r) (svg-line--run-width r char-advance fz)) runs)))
+FONT, CHAR-ADVANCE and font size FZ are passed through to
+`svg-line--run-width'."
+  (apply #'+ (mapcar (lambda (r) (svg-line--run-width r font char-advance fz)) runs)))
 
 ;;;; Image builders (public, pure: data in, svg object out)
 ;; ----------------------------------------------------------------
@@ -376,6 +768,47 @@ Each entry is (X TOP W (TEXT . PLIST)); a side channel like
 (defvar svg-line--lines-lh 0
   "Row height from the last `svg-line-image' call.  Side channel.")
 
+(defvar svg-line--seg-shape 'round
+  "Shape of a segment's background.  Bound by `svg-line-image\' per line.
+A side channel for the same reason as `svg-line--seg-acc\': it is a property
+of the whole image, and threading it through `svg-line--draw-runs\' and its
+three call sites would say nothing the binding does not.")
+
+(defvar svg-line--seg-slant nil
+  "Pixels of angle on a shaped segment background.  Bound by `svg-line-image\'.")
+
+(defun svg-line--seg-box (svg x top cw lh fill)
+  "Paint a CW-by-LH segment background at X,TOP on SVG in FILL.
+
+Shaped by `svg-line--seg-shape\':
+
+  `round\'   a rounded pill (the default, and what every bar drew before
+             the others existed)
+  `square\'  the same rectangle, corners left alone
+  `arrow\'   a powerline chevron: square left edge, right edge drawn to a
+             point `svg-line--seg-slant\' pixels deep
+  `slant\'   a parallelogram, both edges leaning the same way
+
+The angle is cut INTO the segment rather than added on: a chip\'s label
+carries its own leading and trailing space, so the point eats padding that
+was already there and the shape never reaches past CW into whatever is
+drawn next.  That is what lets a shaped chip sit in a line laid out for
+rectangles without shifting anything."
+  (let* ((s (max 0 (min (or svg-line--seg-slant 0) (max 0 (1- cw)))))
+         (r (+ x cw))
+         (b (+ top lh))
+         (m (+ top (/ lh 2))))
+    (pcase svg-line--seg-shape
+      ('square (svg-rectangle svg x top cw lh :fill fill))
+      ('arrow (svg-polygon svg (list (cons x top) (cons (- r s) top)
+                                     (cons r m)
+                                     (cons (- r s) b) (cons x b))
+                           :fill fill))
+      ('slant (svg-polygon svg (list (cons (+ x s) top) (cons r top)
+                                     (cons (- r s) b) (cons x b))
+                           :fill fill))
+      (_ (svg-rectangle svg x top cw lh :fill fill :rx 3)))))
+
 (defun svg-line--draw-runs (svg runs x top fz lh font char-advance foreground
                                 &optional hovered hover-color)
   "Draw RUNS left-to-right in SVG starting at X (row top at TOP).
@@ -392,7 +825,15 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                                      :font font :font-size fz :fill foreground))))
       (:seg  (let* ((str (nth 1 run))
                     (plist (nth 2 run))
-                    (cw (* (length str) char-advance))
+                    ;; a segment may name its own family -- that is what lets
+                    ;; one line mix faces, e.g. a handwriting cut for one chip
+                    ;; among mechanical ones.  It is sized to match the line
+                    ;; optically and advanced at its own rate.
+                    (face (svg-line--run-face run font fz char-advance))
+                    (sfont (nth 0 face))
+                    (sfz (nth 1 face))
+                    (sadv (nth 2 face))
+                    (cw (svg-line--string-width str sadv sfz sfont))
                     (id (plist-get plist :id))
                     (hov (and hover-color hovered id (equal id hovered)))
                     (col (plist-get plist :color))
@@ -404,12 +845,12 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                                        (face-foreground face nil 'default)))
                                 (t foreground))))
                (when bg
-                 (svg-rectangle svg x top cw lh :fill (svg-line--color bg) :rx 3))
+                 (svg-line--seg-box svg x top cw lh (svg-line--color bg)))
                (when hov
-                 (svg-rectangle svg x top cw lh :fill hover-color :rx 3))
+                 (svg-line--seg-box svg x top cw lh hover-color))
                (when (> (length str) 0)
                  (svg-line--add-text svg str :x x :y (+ top fz)
-                                     :font font :font-size fz :fill fill :weight weight))
+                                     :font sfont :font-size sfz :fill fill :weight weight))
                (push (list x top cw (cons str plist)) svg-line--seg-acc)))
       (:pie  (let* ((frac (max 0.0 (min 1.0 (float (nth 1 run)))))
                     (fill (svg-line--color (or (nth 2 run) foreground)))
@@ -429,7 +870,7 @@ and its placement (X TOP WIDTH (STR . PLIST)) is pushed onto
                (when bg (svg-rectangle svg x by bw bh :fill (svg-line--color bg) :rx 2))
                (svg-rectangle svg x by (max 1 (round (* bw frac))) bh
                               :fill (svg-line--color fill) :rx 2))))
-    (setq x (+ x (svg-line--run-width run char-advance fz))))
+    (setq x (+ x (svg-line--run-width run font char-advance fz))))
   x)
 
 (defun svg-line--draw-pie-at (svg cx cy r frac fill bg)
@@ -449,30 +890,78 @@ FILL and BG are already-resolved colours."
                                               cx cy cx (- cy r) r r large ex ey))
                              (cons 'fill fill))))))))
 
+(defcustom svg-line-clock-ticks 4
+  "How many tick marks a `:clock' span wears: 12, 4, or 0 for none.
+Twelve is a lot of ink at bar sizes -- the marks crowd the rim and the face
+reads as a texture rather than a clock.  Four keeps the orientation."
+  :type '(choice (const :tag "None" 0) (const :tag "Quarters" 4)
+                 (const :tag "Hours" 12)))
+
 (defun svg-line--draw-clock (svg cx cy r color &optional accent)
   "Draw an analog clock face on SVG centred at CX,CY radius R, showing now.
-COLOR is the rim/ticks/hour-hand colour; ACCENT (or COLOR) the minute hand."
+COLOR is the rim/ticks/hour-hand colour; ACCENT (or COLOR) the minute hand.
+
+Everything is in floating point.  Rounding the strokes to whole pixels is
+what made this read as blocky at bar sizes: at r=20 the rim, the ticks and
+both hands all collapsed onto one or two pixels and the face lost its
+hierarchy entirely.  Sub-pixel strokes antialias instead, so the weights
+stay distinct however small the bar -- which also means the same code looks
+right under a font that makes the bar 51px tall and one that makes it 57.
+
+The hands carry a short tail past the pivot, as a real watch does; it is
+what stops them reading as bars radiating from a dot."
   (let* ((tm (decode-time))
          (mn (decoded-time-minute tm))
          (hr (mod (decoded-time-hour tm) 12))
          (ma (* (/ mn 60.0) 2 float-pi))
          (ha (* (/ (+ hr (/ mn 60.0)) 12.0) 2 float-pi))
          (col (svg-line--color color))
-         (acc (svg-line--color (or accent color))))
+         (acc (svg-line--color (or accent color)))
+         (tail (* r 0.16)))
     (cl-flet ((hand (ang len w c)
-                (svg-line svg cx cy (round (+ cx (* len (sin ang))))
-                          (round (- cy (* len (cos ang))))
+                (svg-line svg
+                          (- cx (* tail (sin ang))) (+ cy (* tail (cos ang)))
+                          (+ cx (* len (sin ang)))  (- cy (* len (cos ang)))
                           :stroke c :stroke-width w :stroke-linecap "round")))
+      ;; a hairline rim, not a ring: at this size a heavy circle is the whole
+      ;; picture and the hands disappear inside it
       (svg-circle svg cx cy r :fill "none" :stroke col
-                  :stroke-width (max 1 (round (* r 0.09))))
-      (dotimes (i 12)
-        (let* ((a (* (/ i 12.0) 2 float-pi)) (r1 (* r 0.80)) (r2 (* r 0.93)))
-          (svg-line svg (round (+ cx (* r1 (sin a)))) (round (- cy (* r1 (cos a))))
-                    (round (+ cx (* r2 (sin a)))) (round (- cy (* r2 (cos a))))
-                    :stroke col :stroke-width (max 1 (round (* r 0.055))))))
-      (hand ha (* r 0.50) (max 1 (round (* r 0.14))) col)
-      (hand ma (* r 0.80) (max 1 (round (* r 0.09))) acc)
-      (svg-circle svg cx cy (max 1 (round (* r 0.09))) :fill acc))))
+                  :stroke-width (* r 0.045) :stroke-opacity 0.55)
+      (when (> svg-line-clock-ticks 0)
+        (dotimes (i svg-line-clock-ticks)
+          (let ((a (* (/ (float i) svg-line-clock-ticks) 2 float-pi))
+                (r1 (* r 0.74)) (r2 (* r 0.88)))
+            (svg-line svg (+ cx (* r1 (sin a))) (- cy (* r1 (cos a)))
+                      (+ cx (* r2 (sin a))) (- cy (* r2 (cos a)))
+                      :stroke col :stroke-width (* r 0.05)
+                      :stroke-linecap "round" :stroke-opacity 0.75))))
+      (hand ha (* r 0.46) (* r 0.115) col)
+      (hand ma (* r 0.74) (* r 0.075) acc)
+      (svg-circle svg cx cy (* r 0.06) :fill acc))))
+
+;;;###autoload
+(defun svg-line-span-metrics (font font-size line-pad rows)
+  "Return (HEIGHT . RADIUS) for a row-spanning overlay covering ROWS rows.
+
+FONT and FONT-SIZE are the line's, so the normalised drawn size is what gets
+used (see `svg-line-normalise-font-size'); LINE-PAD is its per-row padding.
+
+Exported because an edge-aligned `:clock' or `:pie' reserves no room for
+itself -- the caller has to widen the line's `:right-margin' (or `:pad') to
+keep the rows clear of it, and would otherwise have to duplicate this
+geometry and keep the copy in step."
+  (let* ((fz (svg-line--font-size-for font font-size))
+         (h (* rows (+ fz line-pad))))
+    (cons h (max 3 (round (* (/ h 2.0) 0.86))))))
+
+(defun svg-line--span-cx (align gap r width pad)
+  "Centre x for a row-spanning overlay of radius R on a WIDTH-wide image.
+ALIGN is `left', `right' or nil/`center'; GAP insets it from that edge, the
+same way it does for an `:image' span.  PAD is the image's left inset."
+  (pcase align
+    ('left  (+ pad (or gap 0) r))
+    ('right (- width (or gap 0) r))
+    (_ (/ width 2))))
 
 (defun svg-line--svg-intrinsic-size (svg-string)
   "Parse (WIDTH . HEIGHT) in px from an SVG STRING's root element.
@@ -517,6 +1006,12 @@ rasterised <image>."
     (dolist (c (dom-children dom)) (dom-append-child g (copy-tree c)))
     (dom-append-child svg g)))
 
+(defconst svg-line-rule-supported t
+  "Non-nil in versions whose layouts accept `:rule'.
+A caller that wants an inset rule but must still work against an older
+svg-line -- falling back to the `:overline' of the face the image sits on,
+which is full width -- can test this rather than the version string.")
+
 ;;;###autoload
 (cl-defun svg-line-image (rows &key
                                (width 100)
@@ -528,7 +1023,13 @@ rasterised <image>."
                                (margin 0)
                                (margin-y 0)
                                (right-margin 0)
+                               (rule nil)
+                               (rule-height 1)
+                               (rule-margin nil)
+                               (seg-shape 'round)
+                               (seg-slant nil)
                                (char-advance svg-line-char-advance)
+                               (char-advance-ratio svg-line-char-advance-ratio)
                                (foreground "#000000")
                                (background nil)
                                (hovered nil)
@@ -547,7 +1048,9 @@ Each of LEFT, CENTER and RIGHT is either:
   - a list of RUNS, drawn with CHAR-ADVANCE spacing so it can carry inline
     pies, progress bars and interactive segments.  A run is (:text STR),
     (:pie FRACTION FILL BG), (:bar FRACTION PIXELWIDTH FILL BG) or
-    (:seg STR PLIST); see `svg-line--render-runs'.
+    (:seg STR PLIST); see `svg-line--render-runs'.  A `:seg' whose PLIST
+    carries a `:font' is drawn -- and laid out -- in that family instead of
+    FONT, so one line can mix faces.
 FONT, FONT-SIZE, LINE-PAD, PAD, FOREGROUND and BACKGROUND set the text
 family, size, per-row vertical padding, left inset and colours.  PAD-Y insets
 the rows from the top AND bottom of the image, which LINE-PAD cannot do: that
@@ -563,13 +1066,21 @@ box; the placements of all such runs are left in `svg-line--lines-placements'
 ICON, when non-nil, is a (usually Nerd-Font) glyph drawn ONCE at the left
 spanning the FULL image height (a multi-row \"masthead\" icon); ICON-COLOR
 sets its fill, ICON-WIDTH the horizontal space it reserves (default: the image
-height, i.e. square) and ICON-SCALE its size as a fraction of the height.  The
-left-aligned content is inset past it.  Returns an svg object."
+height, i.e. square) and ICON-SCALE how much of that height the glyph's INK
+should fill.  Ink, not em box: a Nerd glyph paints only about half of its em,
+and how much exactly differs per family, so the glyph is measured
+\(`svg-line-glyph-ink') and sized from that.  ICON-SCALE therefore means the
+same thing in every font -- values above 1 are still normal, the em being
+mostly empty.  The left-aligned content is inset past it.  Returns an svg
+object."
   (let* ((foreground (svg-line--color foreground))
          (background (svg-line--color background))
          (hover-color (svg-line--color hover-color))
-         (fz font-size)
-         (char-advance (svg-line--char-advance char-advance fz))
+         ;; the NOMINAL size names an em, and families fill their em very
+         ;; differently; normalise it so the drawn capitals are the same
+         ;; height whatever the family (`svg-line-normalise-font-size')
+         (fz (svg-line--font-size-for font font-size))
+         (char-advance (svg-line--char-advance char-advance fz char-advance-ratio))
          (lh (+ fz line-pad))
          (rx (max 0 (- width margin right-margin)))
          ;; CH is the rows' own height; HEIGHT adds the vertical inset.  The
@@ -589,7 +1100,9 @@ left-aligned content is inset past it.  Returns an svg object."
          (height (max 1 (+ mtop bg-h mbot)))
          (rows-y (+ mtop pad-top))
          (x0 (+ margin pad))
-         (isz (and icon (max 1 (round (* ch icon-scale)))))
+         (ink (and icon (svg-line-glyph-ink icon font)))
+         (isz0 (and icon (max 1 (round (* ch icon-scale
+                                          (svg-line--icon-size-factor font))))))
          ;; Reserved icon width.  `square' reserves the full image height (a
          ;; square cell); an integer reserves that many pixels; otherwise
          ;; reserve only ~the ink width plus a small margin -- Nerd-Font icon
@@ -599,9 +1112,22 @@ left-aligned content is inset past it.  Returns an svg object."
          (iw (cond ((not icon) 0)
                    ((eq icon-width 'square) ch)
                    ((numberp icon-width) icon-width)
-                   (t (+ (round (* isz 0.55)) (round (* fz 0.12))))))
+                   (t (+ (round (* isz0 (nth 0 ink))) (round (* fz 0.12))))))
+         ;; Shrink the glyph if its ink would not fit the cell it was given.
+         ;; The size above fills the cell's HEIGHT, which is all that ever
+         ;; mattered while the icons were Terminess's -- those are as wide as
+         ;; they are tall.  A family whose glyphs are wider than that reaches
+         ;; past the cell's right edge and paints over the row content beside
+         ;; it, and since both are drawn in the same ink the content does not
+         ;; look overlapped so much as MISSING.
+         (isz (and icon
+                   (max 1 (min isz0
+                               (floor (/ (float iw) (max 0.01 (nth 0 ink))))
+                               (floor (/ (float ch) (max 0.01 (nth 1 ink))))))))
          (left-x0 (+ x0 iw))
          (svg (svg-create width height))
+         (svg-line--seg-shape seg-shape)
+         (svg-line--seg-slant (or seg-slant (round (* lh 0.3))))
          (svg-line--seg-acc nil))
     ;; The background stops at the padding rather than filling the whole
     ;; image: PAD-Y exists to put clear space between this bar and the one
@@ -610,20 +1136,46 @@ left-aligned content is inset past it.  Returns an svg object."
     (when background
       (svg-rectangle svg margin mtop (max 1 (- width (* 2 margin))) bg-h
                      :fill background))
+    ;; RULE: a hairline along the TOP of the image, inset from both edges.
+    ;; Drawn here rather than left to the `:overline' of the face the image
+    ;; sits on: redisplay paints a face attribute across the face's whole
+    ;; extent, and for a window-width image that is the whole window, so an
+    ;; overline can never be inset.  Inside the SVG it is inset like
+    ;; everything else -- by MARGIN unless RULE-MARGIN overrides, so by
+    ;; default it lines up with the background rect above rather than
+    ;; reaching past it.  Drawn at y=0, i.e. OUTSIDE margin-y, because the
+    ;; rule marks the edge of the WINDOW, not the edge of the painted bar.
+    (when rule
+      (let ((rm (or rule-margin margin)))
+        (svg-rectangle svg rm 0 (max 1 (- width (* 2 rm)))
+                       (max 1 rule-height) :fill rule)))
     ;; full-height masthead icon on the left, drawn once for the whole image.
     ;; The glyph's ink sits in the left ~half of its em box, so to centre the
     ;; ink within the reserved cell we shift the draw origin left by ~a quarter
     ;; of the em (clamped to PAD); for a tight cell this collapses to flush-left.
     (when icon
-      ;; Empirically (for typical icon glyphs) the ink is ~0.51 of the em, its
-      ;; vertical centre sits ~0.335 em above the baseline and its horizontal
-      ;; centre ~0.255 em right of the origin; offset by those to centre the ink
-      ;; in the reserved cell (clamped to PAD so a tight cell stays flush-left).
-      (let ((svg-line-glyph-scale 1.0)   ; size the glyph explicitly, not via the run scale
-            (ix (max x0 (- (+ x0 (/ iw 2)) (round (* isz 0.255))))))
+      ;; INK is (WIDTH HEIGHT LEFT TOP) as fractions of the em, measured from
+      ;; this glyph in this font.  Its centre therefore sits LEFT + WIDTH/2
+      ;; right of the origin and TOP - HEIGHT/2 above the baseline; offset by
+      ;; those to centre the INK in the reserved cell rather than the mostly
+      ;; empty em box around it.  These were constants -- 0.255 and 0.335,
+      ;; which is Terminess measured by hand -- and so put every other font's
+      ;; icon in the wrong place.
+      ;;
+      ;; The floor is on the INK's left edge, not on the glyph's origin.
+      ;; Clamping the origin to PAD looks like the same thing and is not: a
+      ;; glyph whose ink sits well right of its origin needs to be drawn from
+      ;; further left than PAD to land centred, and stopping it at PAD instead
+      ;; slides the whole ink right, out through the cell's other side and
+      ;; over the row content beginning there.
+      (let* ((svg-line-glyph-scale 1.0)  ; size the glyph explicitly, not via the run scale
+             (icx (+ (nth 2 ink) (/ (nth 0 ink) 2.0)))
+             (icy (- (nth 3 ink) (/ (nth 1 ink) 2.0)))
+             (ix (max (- x0 (round (* isz (nth 2 ink))))
+                      (- (+ x0 (/ iw 2)) (round (* isz icx))))))
         (svg-line--add-text svg icon
                             :x ix
-                            :y (round (+ rows-y (/ ch 2.0) (* isz 0.335)))
+                            :y (round (+ rows-y (/ ch 2.0) (* isz icy)))
                             :font font :font-size isz
                             :fill (svg-line--color (or icon-color foreground)))))
     (cl-loop for row in rows
@@ -652,7 +1204,7 @@ left-aligned content is inset past it.  Returns an svg object."
                                         :font font :font-size fz :fill foreground))
                    ((consp c)
                     (let* ((cc (svg-line--runs-rtrim (svg-line--runs-ltrim c)))
-                           (cw (svg-line--runs-width cc char-advance fz)))
+                           (cw (svg-line--runs-width cc font char-advance fz)))
                       (svg-line--draw-runs svg cc (max x0 (/ (- width cw) 2))
                                            top fz lh font char-advance foreground
                                            hovered hover-color))))
@@ -665,13 +1217,17 @@ left-aligned content is inset past it.  Returns an svg object."
                                         :font font :font-size fz :fill foreground))
                    ((consp r)
                     (let ((rr (svg-line--runs-rtrim r)))
-                      (svg-line--draw-runs svg rr (max x0 (- rx (svg-line--runs-width rr char-advance fz)))
+                      (svg-line--draw-runs svg rr (max x0 (- rx (svg-line--runs-width rr font char-advance fz)))
                                            top fz lh font char-advance foreground
                                            hovered hover-color))))))
     ;; Centred, row-spanning overlays drawn once over a row range, on top of
     ;; the rows (whose `:center' should be empty there to avoid collision).
-    ;; SPEC: (:clock (ROW-A . ROW-B) COLOR ACCENT) or
-    ;;       (:pie   (ROW-A . ROW-B) FRACTION FILL BG).  Rows 0-indexed, inclusive.
+    ;; SPEC: (:clock (ROW-A . ROW-B) COLOR ACCENT &optional ALIGN GAP) or
+    ;;       (:pie   (ROW-A . ROW-B) FRACTION FILL BG &optional ALIGN GAP).
+    ;; Rows 0-indexed, inclusive.  ALIGN is `left', `right' or nil for
+    ;; centred, GAP its inset from that edge -- as for an `:image' span.
+    ;; An edge-aligned overlay does NOT reserve room: give the line a
+    ;; `:right-margin' (or `:pad') wide enough that the rows stop clear of it.
     (dolist (span spans)
       (when (consp span)
         (let* ((rng (nth 1 span))
@@ -682,12 +1238,15 @@ left-aligned content is inset past it.  Returns an svg object."
                (cy (round (+ rows-y (* lh a) (/ sh 2.0))))
                (r (max 3 (round (* (/ sh 2.0) 0.86)))))
           (pcase (car span)
-            (:clock (svg-line--draw-clock svg cx cy r (or (nth 2 span) foreground)
-                                          (nth 3 span)))
-            (:pie   (svg-line--draw-pie-at svg cx cy r
-                                           (max 0.0 (min 1.0 (float (nth 2 span))))
-                                           (svg-line--color (or (nth 3 span) foreground))
-                                           (svg-line--color (or (nth 4 span) "#d4dcea"))))
+            (:clock (svg-line--draw-clock
+                     svg (svg-line--span-cx (nth 4 span) (nth 5 span) r width pad)
+                     cy r (or (nth 2 span) foreground) (nth 3 span)))
+            (:pie   (svg-line--draw-pie-at
+                     svg (svg-line--span-cx (nth 5 span) (nth 6 span) r width pad)
+                     cy r
+                     (max 0.0 (min 1.0 (float (nth 2 span))))
+                     (svg-line--color (or (nth 3 span) foreground))
+                     (svg-line--color (or (nth 4 span) "#d4dcea"))))
             ;; (:image (ROW-A . ROW-B) IMAGE-OR-SVG &optional ALIGN GAP)
             ;; IMAGE-OR-SVG: an Emacs image (its :data, an SVG string) or a raw
             ;; SVG string.  Scaled to the span height, aligned left/center/right.
@@ -709,7 +1268,11 @@ left-aligned content is inset past it.  Returns an svg object."
                     (col (svg-line--color (or (nth 4 span) foreground)))
                     (gap (or (nth 5 span) (round (* fz 0.6))))
                     (gsz (or (nth 6 span) (round (* fz 1.7))))
-                    (gw (round (* gsz 0.5)))       ; Terminess Mono glyph advance ~0.5em
+                    ;; the flanking glyph is drawn at GSZ, so it advances
+                    ;; GSZ * the font's em ratio -- which CHAR-ADVANCE at FZ
+                    ;; already encodes.  Was hardcoded to 0.5em, which is
+                    ;; Terminess's ratio and nobody else's.
+                    (gw (round (* gsz (/ (float char-advance) fz))))
                     (tgap (max 1 (round (* fz 0.1))))
                     (tyt (round (+ cy (* fz 0.36))))
                     (tyg (round (+ cy (* gsz 0.36))))
@@ -854,7 +1417,16 @@ the window under the mouse, but the FRAME-level tab bar isn't tied to a buffer
   "Return an interactive `lines' segment carrying TEXT and PLIST.
 PLIST keys: `:id' (unique hover/identity key), `:help', `:action' (a command
 run on left/middle click), `:action-help' (the \"click to ...\" hint), `:menu'
-\(an alist (LABEL . COMMAND) for right-click) and `:color'/`:face' (text fill).
+\(an alist (LABEL . COMMAND) for right-click), `:color'/`:face' (text fill),
+`:bg' (a persistent background pill), `:weight' (e.g. \"bold\") and `:font'
+\(a family of its own).
+
+`:font' is how one line carries several faces -- a handwriting cut for one
+chip among mechanical ones, say.  The segment is laid out at THAT family's
+advance, measured (`svg-line-font-advance') rather than assumed, so the
+families need not be metrically related and what follows the segment still
+starts clear of it.
+
 Use as a segment in a `lines' content side; the engine tracks its pixel extent
 and wires click/hover/menu just like a `wrap' tab.  Returns nil for empty TEXT
 \(so an absent indicator contributes nothing).  See `svg-line-define'."
@@ -943,11 +1515,13 @@ empty STR.  For finer control (a custom action/help/id) build on
                                     :action handler))
                   text)))))))
 
-(defun svg-line--wrap-place (items width char-advance gap lh
-                                   &optional center x0 x1 y0)
+(defun svg-line--wrap-place (items width font char-advance fz gap lh
+                             &optional center x0 x1 y0)
   "Return placements (X TOP CW ITEM) for ITEMS in a `wrap' layout.
-WIDTH bounds each row; CHAR-ADVANCE, GAP and LH set per-item width and row
-height.  X0 and X1 bound the flow horizontally (items start at X0 and wrap
+WIDTH bounds each row; FONT, CHAR-ADVANCE, FZ, GAP and LH set per-item width
+and row height.  FZ is needed because a label's icon glyphs are drawn larger
+than its text and so advance further -- see `svg-line--string-width'.
+X0 and X1 bound the flow horizontally (items start at X0 and wrap
 at X1, both absolute so the caller can fold a margin and a padding into
 them); Y0 is the absolute top of the first row.  When CENTER is non-nil and
 the items all fit on a single row (no wrapping), that row is centred between
@@ -961,11 +1535,16 @@ what keeps the hover and click boxes under the tabs they moved with."
          (x x0) (row 0) (out nil))
     (dolist (it items)
       (let* ((label (car it))
-             (cw (* (length label) char-advance))
+             (cw (svg-line--string-width label char-advance fz font))
              (w  (+ cw (* gap char-advance))))
         (when (and (> x x0) (> (+ x w) right))
           (setq x x0 row (1+ row)))
-        (push (list x (+ y0 (* row lh)) cw it) out)
+        ;; X and CW are rounded HERE, at the point of emission, while the
+        ;; flow itself keeps accumulating fractionally.  These placements
+        ;; become image-map rectangles, which must be whole pixels; rounding
+        ;; the advance instead would drift the row (see
+        ;; `svg-line--char-advance').
+        (push (list (round x) (+ y0 (* row lh)) (round cw) it) out)
         (setq x (+ x w))))
     (setq out (nreverse out))
     ;; centre a single (un-wrapped) row: shift every placement right by half
@@ -1004,10 +1583,16 @@ property so `svg-line--note-help' can track which item the mouse is over."
                                      (font-size svg-line-font-size)
                                      (line-pad svg-line-line-pad)
                                      (char-advance svg-line-char-advance)
+                                     (char-advance-ratio svg-line-char-advance-ratio)
                                      (pad 0)
                                      (pad-y 0)
                                      (margin 0)
                                      (margin-y 0)
+                                     (rule nil)
+                                     (rule-height 1)
+                                     (rule-margin nil)
+                                     (lead nil)
+                                     (lead-x nil)
                                      (gap 3)
                                      (foreground "#000000")
                                      (background nil)
@@ -1021,7 +1606,8 @@ property so `svg-line--note-help' can track which item the mouse is over."
                                      (center nil))
   "Build a `wrap'-layout SVG from ITEMS, a list of (LABEL . STATE).
 Items flow left-to-right and wrap onto new rows at WIDTH.  GAP is the
-inter-item gap in character widths.
+inter-item gap in character widths.  CHAR-ADVANCE-RATIO sets the advance as
+a fraction of the font size when CHAR-ADVANCE pins no pixel value.
 
 Spacing comes in two kinds, as in CSS.  MARGIN and MARGIN-Y sit OUTSIDE the
 background: clear space that separates this bar from whatever is next to it.
@@ -1058,8 +1644,11 @@ pointer)."
          (modified-background (svg-line--color modified-background))
          (tab-background (svg-line--color tab-background))
          (hover-color (svg-line--color hover-color))
-         (fz font-size)
-         (char-advance (svg-line--char-advance char-advance fz))
+         ;; the NOMINAL size names an em, and families fill their em very
+         ;; differently; normalise it so the drawn capitals are the same
+         ;; height whatever the family (`svg-line-normalise-font-size')
+         (fz (svg-line--font-size-for font font-size))
+         (char-advance (svg-line--char-advance char-advance fz char-advance-ratio))
          (lh (+ fz line-pad))
          (pad-y (svg-line--pad-y pad-y))
          (pad-top (car pad-y))
@@ -1070,7 +1659,7 @@ pointer)."
          (rows-y (+ mtop pad-top))
          (x0 (+ margin pad))
          (x1 (max (1+ x0) (- width margin pad)))
-         (placements (svg-line--wrap-place items width char-advance gap lh
+         (placements (svg-line--wrap-place items width font char-advance fz gap lh
                                            center x0 x1 rows-y))
          ;; The placer has already put the first row at ROWS-Y, so the tallest
          ;; placement accounts for the top margin and padding both.
@@ -1087,6 +1676,36 @@ pointer)."
     (when background
       (svg-rectangle svg margin mtop (max 1 (- width (* 2 margin))) bg-h
                      :fill background))
+    ;; RULE: a hairline along the TOP of the image, inset from both edges.
+    ;; Drawn here rather than left to the `:overline' of the face the image
+    ;; sits on: redisplay paints a face attribute across the face's whole
+    ;; extent, and for a window-width image that is the whole window, so an
+    ;; overline can never be inset.  Inside the SVG it is inset like
+    ;; everything else -- by MARGIN unless RULE-MARGIN overrides, so by
+    ;; default it lines up with the background rect above rather than
+    ;; reaching past it.  Drawn at y=0, i.e. OUTSIDE margin-y, because the
+    ;; rule marks the edge of the WINDOW, not the edge of the painted bar.
+    (when rule
+      (let ((rm (or rule-margin margin)))
+        (svg-rectangle svg rm 0 (max 1 (- width (* 2 rm)))
+                       (max 1 rule-height) :fill rule)))
+    ;; LEAD: drawn in the LEFT MARGIN -- the strip between the window edge and
+    ;; X0 that the flow never reaches, because X0 is `margin' + `pad' in.
+    ;; Deliberately NOT an item: `svg-line--wrap-place' would give it a slot,
+    ;; and a slot that appears and disappears pushes every tab sideways as it
+    ;; comes and goes.  For something transient -- a window-picking key, up
+    ;; for as long as it takes to press it -- a bar that jumps is worse than
+    ;; one with an empty margin.  Same pill as a current tab: this is the one
+    ;; thing on the line asking to be read.
+    (when (and lead (> (length lead) 0))
+      (let ((lw (max 1 (round (svg-line--string-width lead char-advance fz font))))
+            (lx (or lead-x pad)))
+        (when current-background
+          (svg-rectangle svg lx rows-y lw lh :fill current-background :rx 3))
+        (svg-line--add-text svg lead :x lx :y (+ rows-y fz)
+                            :font font :font-size fz
+                            :fill (or current-foreground foreground)
+                            :weight "bold")))
     (dolist (p placements)
       (cl-destructuring-bind (px top cw it) p
         (let* ((label (car it))
@@ -1311,11 +1930,22 @@ gets a hover box.  Sizes scale with the default font (see
      :margin (svg-line--scaled (svg-line--opt spec :margin 0))
      :margin-y (svg-line--scaled (svg-line--opt spec :margin-y 0))
      :right-margin (svg-line--scaled (svg-line--opt spec :right-margin 0))
+     :rule (svg-line--opt spec :rule nil)
+     :rule-height (svg-line--scaled (svg-line--opt spec :rule-height 1))
+     :rule-margin (let ((m (svg-line--opt spec :rule-margin nil)))
+                    (and m (svg-line--scaled m)))
+     :seg-shape (svg-line--opt spec :seg-shape 'round)
+     :seg-slant (let ((v (svg-line--opt spec :seg-slant nil)))
+                  (and v (svg-line--scaled v)))
      ;; nil lets `svg-line-image' derive the advance from the (scaled) font
      ;; size; an explicit value is scaled to match.
      :char-advance (let ((e (or (svg-line--opt spec :char-advance nil)
                                 svg-line-char-advance)))
                      (and e (* e sc)))
+     ;; NOT scaled: a ratio is scale-free, and `svg-line-image' applies it to
+     ;; the already-scaled font size.
+     :char-advance-ratio (svg-line--opt spec :char-advance-ratio
+                                        svg-line-char-advance-ratio)
      :foreground fg
      :background bg
      :hovered svg-line--hovered
@@ -1353,10 +1983,19 @@ mirroring the `lines' layout."
                          :char-advance (let ((e (or (svg-line--opt spec :char-advance nil)
                                                     svg-line-char-advance)))
                                          (and e (* e sc)))
+                         :char-advance-ratio (svg-line--opt spec :char-advance-ratio
+                                                            svg-line-char-advance-ratio)
                          :pad (svg-line--scaled (svg-line--opt spec :pad 0))
                          :pad-y (svg-line--scaled (svg-line--opt spec :pad-y 0))
                          :margin (svg-line--scaled (svg-line--opt spec :margin 0))
                          :margin-y (svg-line--scaled (svg-line--opt spec :margin-y 0))
+                         :rule (svg-line--opt spec :rule nil)
+                         :rule-height (svg-line--scaled (svg-line--opt spec :rule-height 1))
+                         :rule-margin (let ((m (svg-line--opt spec :rule-margin nil)))
+                                        (and m (svg-line--scaled m)))
+                         :lead (svg-line--opt spec :lead nil)
+                         :lead-x (let ((x (svg-line--opt spec :lead-x nil)))
+                                   (and x (svg-line--scaled x)))
                          :gap (svg-line--opt spec :gap 3)
                          :foreground (funcall pick :foreground :inactive-foreground "#000000")
                          :background (funcall pick :background :inactive-background)
@@ -1672,7 +2311,12 @@ Recognised SPEC keys:
            while a minibuffer session previews other buffers, which
            would otherwise flip the segments (and repaint the bar with
            alternating images) on every preview.
-  :font :font-size :line-pad :char-advance
+  :font :font-size :line-pad :char-advance :char-advance-ratio
+           :char-advance-ratio is the per-character advance as a FRACTION of
+           the font size, and is the one to set when a line names its own
+           :font -- it is a property of that family, so it stays right as the
+           font size changes.  :char-advance pins the advance in pixels
+           instead, for one family at one size.
   :pad :pad-y :margin :margin-y :right-margin
            Spacing, in the CSS sense.  :margin/:margin-y are OUTSIDE the
            background -- clear space separating this bar from its neighbour,
@@ -1684,6 +2328,32 @@ Recognised SPEC keys:
            cons (TOP . BOTTOM).  :line-pad is neither: it grows the space
            below EACH ROW, so it separates rows and pads the bottom but never
            the top.  Both layouts.
+  :rule :rule-height :rule-margin
+           A hairline along the TOP of the image: :rule is its colour (nil,
+           the default, draws none), :rule-height its thickness in pixels
+           (1), :rule-margin its inset from both edges (nil = :margin, so it
+           lines up with the painted background).  It sits at the very top,
+           outside :margin-y, marking the edge of the WINDOW rather than of
+           the bar.  This is what the `:overline' of the face the image sits
+           on cannot do: redisplay paints that across the face's whole
+           extent, which for a window-width image is the whole window.
+           Both layouts.
+  :seg-shape :seg-slant
+           `lines' only.  The background shape of an interactive segment --
+           the chips a mode line is built from.  `round' (default), `square',
+           `arrow' (a powerline chevron) or `slant' (a parallelogram);
+           :seg-slant is how deep the angle cuts, in pixels (default ~0.3 of
+           the row height).  See `svg-line--seg-box': the angle is cut into
+           the segment, not added to it, so a shaped chip occupies exactly
+           the width a rectangular one did.
+  :lead :lead-x
+           `wrap' only.  :lead is a short string drawn as a pill in the LEFT
+           MARGIN -- the strip outside the item flow, which is otherwise
+           empty -- at :lead-x pixels from the window edge (default :pad).
+           Outside the flow on purpose: an item would be given a slot, and a
+           slot that comes and goes shifts every tab with it.  Styled as a
+           current tab.  Not in the hit-test map: it is an indicator, not a
+           target.
   :foreground :background
   :active   a predicate; when present and false, inactive variants apply
   :inactive-foreground :inactive-background

@@ -93,8 +93,8 @@
 (ert-deftest svg-line/wrap-center-single-row ()
   "With CENTER, items that fit on one row are shifted right (centred)."
   (let* ((items (list (cons "aa" nil) (cons "bb" nil)))
-         (flush    (svg-line--wrap-place items 1000 8 1 14 nil))
-         (centered (svg-line--wrap-place items 1000 8 1 14 t)))
+         (flush    (svg-line--wrap-place items 1000 "Monospace" 8 16 1 14 nil))
+         (centered (svg-line--wrap-place items 1000 "Monospace" 8 16 1 14 t)))
     (should (= 0 (nth 0 (car flush))))         ; flush-left: first item at x=0
     (should (> (nth 0 (car centered)) 0))      ; centred: shifted right
     ;; the inter-item offset is preserved (whole row shifts by the same amount)
@@ -105,7 +105,7 @@
   "CENTER only affects a single row; a wrapped layout keeps its flush-left flow."
   (let* ((items (mapcar (lambda (i) (cons (format "tab%d" i) nil))
                         (number-sequence 1 20)))
-         (centered (svg-line--wrap-place items 80 8 1 14 t)))
+         (centered (svg-line--wrap-place items 80 "Monospace" 8 16 1 14 t)))
     (should (= 0 (nth 0 (car centered))))                       ; first item flush
     (should (> (apply #'max (mapcar (lambda (p) (nth 1 p)) centered)) 0)))) ; wrapped
 
@@ -536,7 +536,7 @@ with the modified accent so the unsaved state stays visible."
 
 (ert-deftest svg-line/wrap-pad-and-margin-place-items ()
   "In `wrap\='), X0 is MARGIN+PAD and rows start at MARGIN-Y+PAD-Y."
-  (let ((p (car (svg-line--wrap-place (list (cons "aa" nil)) 1000 8 1 14 nil 30 970 7))))
+  (let ((p (car (svg-line--wrap-place (list (cons "aa" nil)) 1000 "Monospace" 8 16 1 14 nil 30 970 7))))
     (should (= 30 (nth 0 p)))
     (should (= 7 (nth 1 p)))))
 
@@ -574,3 +574,214 @@ with the modified accent so the unsaved state stays visible."
             ((symbol-function 'window-right-divider-width) (lambda (&rest _) 0))
             ((symbol-function 'window-scroll-bar-width) (lambda (&rest _) 0)))
     (should (= 500 (svg-line--window-width)))))
+
+;;;; Font metrics: advance, icon advance, and the ink box
+
+(ert-deftest svg-line/char-advance-ratio-and-explicit ()
+  "An explicit advance wins; otherwise the ratio scales with the font size."
+  (should (= 8 (svg-line--char-advance 8 15 0.5)))
+  (should (= 7.5 (svg-line--char-advance nil 15 0.5)))
+  (should (= 11.6625 (svg-line--char-advance nil 15 0.7775)))
+  ;; no ratio given falls back to the global one
+  (let ((svg-line-char-advance-ratio 0.6))
+    (should (= 9.0 (svg-line--char-advance nil 15 nil))))
+  ;; NOT rounded: half a pixel per character is twenty pixels over a row
+  (should (= 7.5 (svg-line--char-advance nil 15 0.5))))
+
+(ert-deftest svg-line/string-width-counts-icons-larger ()
+  "Icon glyphs advance by their enlarged size, text by the plain advance."
+  (let ((icon (string #xF0614)))
+    (let ((svg-line-glyph-scale 1.0))
+      (should (= 22.5 (svg-line--string-width "abc" 7.5 15)))
+      (should (= 30.0 (svg-line--string-width (concat "abc" icon) 7.5 15))))
+    (let ((svg-line-glyph-scale 1.4))
+      ;; the tspan is drawn at (round (* 15 1.4)) = 21, so the glyph advances
+      ;; 7.5 * 21/15 = 10.5 -- not 7.5, which is what used to be reserved
+      (should (= 10.5 (svg-line--glyph-advance 7.5 15)))
+      (should (= 33.0 (svg-line--string-width (concat "ab" icon "c") 7.5 15)))
+      ;; and a run reports the same width, so what follows it starts clear
+      (should (= 33.0 (svg-line--run-width (list :text (concat "ab" icon "c")) "Monospace" 7.5 15)))
+      (should (= 33.0 (svg-line--run-width (list :seg (concat "ab" icon "c") nil) "Monospace" 7.5 15))))))
+
+(ert-deftest svg-line/right-aligned-runs-reach-the-margin ()
+  "A right-aligned run ends at the right edge, whatever the font's advance."
+  (let* ((icon (string #xF0614))
+         (svg-line-glyph-scale 1.4)
+         (label (concat "right " icon)))       ; 6 text characters + 1 icon
+    (dolist (ratio '(0.5 0.7775))
+      (let* ((ca (* 15 ratio))
+             (want (- 600 (+ (* 6 ca) (svg-line--glyph-advance ca 15))))
+             (svg (svg-line-image (list (cons nil (list (list :text label))))
+                                  :width 600 :font "Monospace" :font-size 15
+                                  :char-advance nil :char-advance-ratio ratio
+                                  :right-margin 0))
+             (x (dom-attr (car (dom-by-tag svg 'text)) 'x)))
+        (should (< (abs (- x want)) 0.001))))))
+
+(ert-deftest svg-line/glyph-ink-falls-back-without-measurement ()
+  "With measuring off, the ink box is the documented constant."
+  (let ((svg-line-measure-fonts nil))
+    (svg-line-forget-font-metrics)
+    (should (equal (svg-line-glyph-ink "x" "Monospace") svg-line-icon-ink-fallback))
+    ;; and the reference font therefore needs no size correction
+    (should (= 1.0 (svg-line--icon-size-factor "Monospace")))))
+
+(ert-deftest svg-line/seg-font-falls-back-to-the-line-font ()
+  "A segment with no `:font\=', or the line's own, lays out at the line advance."
+  (let ((svg-line-measure-fonts nil))
+    (svg-line-forget-font-metrics)
+    (should (= 7.5 (svg-line--run-advance (list :seg "ab" nil) "A" 7.5 15)))
+    (should (= 7.5 (svg-line--run-advance (list :seg "ab" '(:font "A")) "A" 7.5 15)))
+    ;; a different family that cannot be measured keeps the line's advance,
+    ;; which is right for metrically compatible cuts of one superfamily
+    (should (= 7.5 (svg-line--run-advance (list :seg "ab" '(:font "B")) "A" 7.5 15)))
+    ;; a plain text run never carries a font
+    (should (= 7.5 (svg-line--run-advance (list :text "ab") "A" 7.5 15)))))
+
+(ert-deftest svg-line/seg-font-is-drawn-and-laid-out ()
+  "A segment names its family on its own `<text>\=', and the run after it clears."
+  (let* ((svg-line-glyph-scale 1.0)
+         (svg (svg-line-image
+               (list (cons (list (list :seg "ab" '(:font "Other"))
+                                 (list :text "cd"))
+                           nil))
+               :width 400 :font "Base" :font-size 15
+               :char-advance nil :char-advance-ratio 0.5 :pad 0 :margin 0))
+         (texts (dom-by-tag svg 'text)))
+    (should (equal "Other" (dom-attr (nth 0 texts) 'font-family)))
+    (should (equal "Base"  (dom-attr (nth 1 texts) 'font-family)))
+    ;; "ab" is two characters at 7.5, so the text run starts at 15
+    (should (= 15.0 (dom-attr (nth 1 texts) 'x)))))
+
+(ert-deftest svg-line/font-size-normalisation-is-opt-out ()
+  "With normalising off, `:font-size' is taken literally."
+  (let ((svg-line-normalise-font-size nil))
+    (should (= 15 (svg-line--font-size-for "Anything" 15)))
+    (should (= 1.0 (svg-line--font-size-factor "Anything"))))
+  ;; and an unmeasurable font is left alone rather than guessed at
+  (let ((svg-line-measure-fonts nil))
+    (svg-line-forget-font-metrics)
+    (should (null (svg-line-cap-height "Anything")))
+    (should (= 15 (svg-line--font-size-for "Anything" 15)))
+    ;; the icon fallback describes an ICON and must not stand in for a cap
+    (should (equal svg-line-icon-ink-fallback (svg-line-glyph-ink "M" "Anything")))
+    (should (null (svg-line--measure-ink "M" "Anything")))))
+
+(ert-deftest svg-line/masthead-ink-is-clamped-to-its-cell ()
+  "A glyph whose ink is wider than its cell is shrunk, not left to overflow."
+  (let* ((svg-line-measure-fonts nil)
+         ;; the fallback ink is half an em wide, so a cell narrower than
+         ;; (SIZE * 0.5) must pull the size down
+         (svg (svg-line-image (list (cons "x" nil))
+                              :width 400 :font "Monospace" :font-size 15
+                              :char-advance-ratio 0.5
+                              :icon "I" :icon-width 20 :icon-scale 4.0))
+         (icon-text (car (dom-by-tag svg 'text)))
+         (size (dom-attr icon-text 'font-size)))
+    ;; 20px of cell at half an em of ink caps the size at 40
+    (should (<= (* size (nth 0 svg-line-icon-ink-fallback)) 20))
+    (should (<= size 40))))
+
+(ert-deftest svg-line/normalise-basis-selects-and-blends ()
+  "The normalisation basis picks cap, advance, or a blend of the two."
+  (cl-letf (((symbol-function 'svg-line-cap-height) (lambda (_) 0.725))
+            ((symbol-function 'svg-line-font-advance) (lambda (_) 0.7775)))
+    (let* ((fc (/ svg-line-cap-height-reference 0.725))
+           (fa (/ svg-line-advance-reference 0.7775)))
+      (let ((svg-line-normalise-font-size 'cap))
+        (should (< (abs (- (svg-line--font-size-factor "F") fc)) 1e-6)))
+      (let ((svg-line-normalise-font-size t))     ; t is a synonym for cap
+        (should (< (abs (- (svg-line--font-size-factor "F") fc)) 1e-6)))
+      (let ((svg-line-normalise-font-size 'advance))
+        (should (< (abs (- (svg-line--font-size-factor "F") fa)) 1e-6)))
+      (let ((svg-line-normalise-font-size 0.5))
+        (should (< (abs (- (svg-line--font-size-factor "F") (/ (+ fc fa) 2))) 1e-6)))
+      (let ((svg-line-normalise-font-size nil))
+        (should (= 1.0 (svg-line--font-size-factor "F"))))
+      ;; out-of-range blends clamp rather than extrapolate
+      (let ((svg-line-normalise-font-size 5.0))
+        (should (< (abs (- (svg-line--font-size-factor "F") fa)) 1e-6)))))
+  ;; the reference family is the fixed point under every basis
+  (cl-letf (((symbol-function 'svg-line-cap-height)
+             (lambda (_) svg-line-cap-height-reference))
+            ((symbol-function 'svg-line-font-advance)
+             (lambda (_) svg-line-advance-reference)))
+    (dolist (mode '(cap advance 0.0 0.5 1.0))
+      (let ((svg-line-normalise-font-size mode))
+        (should (< (abs (- (svg-line--font-size-factor "Ref") 1.0)) 1e-6))))))
+
+(ert-deftest svg-line/tracking-corrects-a-mis-advanced-font ()
+  "The correction closes the renderer's error, and the width accounts for it."
+  (cl-letf (((symbol-function 'svg-line-font-advance-native) (lambda (_) 0.62))
+            ((symbol-function 'svg-line-font-advance-rendered) (lambda (_) 0.7775)))
+    (let ((svg-line-correct-tracking t))
+      ;; the effective advance is the font's own, not the renderer's
+      (should (= 0.62 (svg-line-font-advance "F")))
+      (should (< (abs (- (svg-line-tracking-ratio "F") -0.1575)) 1e-9))
+      ;; the width reserved is the TRUE advance: what the renderer over-advances
+      ;; by is trailing whitespace, never ink, so there is nothing to pad for
+      (let ((svg-line-glyph-scale 1.0))
+        (should (= 62.0 (svg-line--string-width (make-string 10 ?M) 6.2 10 "F")))
+        (should (= 62.0 (svg-line--string-width (make-string 10 ?M) 6.2 10)))))
+    ;; opting out hands back the renderer's own advance and no correction
+    (let ((svg-line-correct-tracking nil))
+      (should (= 0.7775 (svg-line-font-advance "F")))
+      (should (= 0 (svg-line-tracking-ratio "F"))))))
+
+(ert-deftest svg-line/tracking-reaches-the-svg ()
+  "A tracked line carries letter-spacing on its text."
+  (cl-letf (((symbol-function 'svg-line-font-advance-native) (lambda (_) 0.5))
+            ((symbol-function 'svg-line-font-advance-rendered) (lambda (_) 0.6))
+            ((symbol-function 'svg-line-cap-height) (lambda (_) 0.6167)))
+    (let* ((svg-line-correct-tracking t)
+           (svg-line-glyph-scale 1.0)
+           (svg (svg-line-image (list (cons "hello" nil))
+                                :width 300 :font "F" :font-size 20
+                                :char-advance-ratio 0.5))
+           (text (car (dom-by-tag svg 'text))))
+      ;; -0.1 em at 20px (the cap basis leaves the size alone here)
+      (should (< (abs (- (dom-attr text 'letter-spacing) -2.0)) 1e-6)))))
+
+(ert-deftest svg-line/tracking-pulls-later-tspans-back ()
+  "An icon does not space apart the text after it: each tspan gets a `dx\='."
+  (cl-letf (((symbol-function 'svg-line-font-advance-native) (lambda (_) 0.5))
+            ((symbol-function 'svg-line-font-advance-rendered) (lambda (_) 0.6)))
+    (let* ((svg-line-correct-tracking t)
+           (svg-line-glyph-scale 1.4)
+           (svg (svg-create 200 40)))
+      (svg-line--add-text svg (concat "ab" (string #xF0614) "cd")
+                          :x 0 :y 20 :font "F" :font-size 10 :fill "#000")
+      (let* ((spans (dom-by-tag svg 'tspan))
+             (dxs (mapcar (lambda (n) (dom-attr n 'dx)) spans)))
+        (should (= 3 (length spans)))
+        ;; the first tspan flows from the text origin, the rest are pulled back
+        ;; by the previous tspan's un-tracked gap -- at its own drawn size
+        (should (null (nth 0 dxs)))
+        (should (< (abs (- (nth 1 dxs) -1.0)) 1e-6))      ; after text at 10px
+        (should (< (abs (- (nth 2 dxs) -1.4)) 1e-6))))))  ; after a glyph at 14px
+
+(ert-deftest svg-line/no-tracking-emits-no-dx ()
+  "A font the renderer advances correctly is left entirely alone."
+  (cl-letf (((symbol-function 'svg-line-font-advance-native) (lambda (_) 0.5))
+            ((symbol-function 'svg-line-font-advance-rendered) (lambda (_) 0.5)))
+    (let* ((svg-line-glyph-scale 1.4)
+           (svg (svg-create 200 40)))
+      (svg-line--add-text svg (concat "ab" (string #xF0614) "cd")
+                          :x 0 :y 20 :font "F" :font-size 10 :fill "#000")
+      (dolist (n (dom-by-tag svg 'tspan))
+        (should (null (dom-attr n 'dx)))
+        (should (null (dom-attr n 'letter-spacing))))
+      (should (null (dom-attr (car (dom-by-tag svg 'text)) 'letter-spacing))))))
+
+(ert-deftest svg-line/xml-escape-covers-attribute-context ()
+  "The escaper is safe for attribute values, not just text content.
+The font probes format a family name into a quote-delimited attribute, so a
+name carrying a quote would close it early and the rest would parse as
+markup."
+  (should (equal "Plain" (svg-line--xml-escape "Plain")))
+  (should (equal "A&amp;B" (svg-line--xml-escape "A&B")))
+  (should (equal "&lt;i&gt;" (svg-line--xml-escape "<i>")))
+  (should (equal "Odd&quot;Name" (svg-line--xml-escape "Odd\"Name")))
+  ;; nothing of the injected markup survives into the probe
+  (let ((probe (svg-line--xml-escape "X\" onload=\"evil()")))
+    (should-not (string-match-p "\"" probe))))
